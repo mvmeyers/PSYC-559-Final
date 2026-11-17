@@ -1,0 +1,156 @@
+"name","description","variable_type","coding","answer_categories","details","labels","transformation","source","assessment_type","construct","comments"
+"id","Participant ID","categorical","","","","","","","ESM","",""
+"day","Day of study","other","","","","","","","ESM","",""
+"beep","Beep of the day","other","","","","","","","ESM","",""
+"date","Date","Date","","","","","","","ESM","",""
+"survey_duration","Survey Duration","numeric","","","","","","","ESM","",""
+"played24hr","Played Last 24 Hours","binary","","","","","","","ESM","video games, activity, context",""
+"gaming_autonomy","Played Way I Wanted","rating_scale","","7","I could play in the way I wanted.","1 = Strongly Disagree
+4 = Neither Agree nor Disagree
+7 =  Strongly agree","","BANGS","ESM","video games, autonomy, self-determination",""
+"gaming_wish_else","Wished Do Something Else","rating_scale","","7","I often found myself wishing I could do something else.","1 = Strongly Disagree
+4 = Neither Agree nor Disagree
+7 =  Strongly agree","","BANGS","ESM","video games",""
+"gaming_progress","Made Progress","rating_scale","","7","I felt that I made progress while playing.","1 = Strongly Disagree
+4 = Neither Agree nor Disagree
+7 =  Strongly agree","","BANGS","ESM","video games, performance",""
+"gaming_disappointed","Disappointed with Performance","rating_scale","","7","I felt disappointed with my performance.","1 = Strongly Disagree
+4 = Neither Agree nor Disagree
+7 =  Strongly agree","","BANGS","ESM","video games, performance",""
+"gaming_relationships","Formed Relationships","rating_scale","","7","I felt I formed relationships with other players and/or characters.","1 = Strongly Disagree
+4 = Neither Agree nor Disagree
+7 =  Strongly agree","","BANGS","ESM","video games, relationship, social interaction",""
+"gaming_toxic","Toxic Interactions","rating_scale","","7","Interactions with other players and/or characters felt toxic to me.","1 = Strongly Disagree
+4 = Neither Agree nor Disagree
+7 =  Strongly agree","","BANGS","ESM","video games, social interaction",""
+"social_singleplayer","Single-player","other","","","While gaming today, what kind of social interaction did you take part in?
+Single-player games only","","","","ESM","video games, activity, context",""
+"social_friends_realworld","Real-world Friends","other","","","While gaming today, what kind of social interaction did you take part in? 
+Multiplayer with real-world friends","","","","ESM","video games, activity, context",""
+"social_friends_online","Online-only Friends","other","","","While gaming today, what kind of social interaction did you take part in? 
+Multiplayer with online-only friends","","","","ESM","video games, activity, context",""
+"social_strangers","Strangers","other","","","While gaming today, what kind of social interaction did you take part in? 
+Multiplayer with strangers","","","","ESM","video games, activity, context",""
+"most_recent_game","Most Recent Game","freetext","","","What is the name of the game you most recently played?
+This text will be copied into certain other questions, so please write only the game name and use abbreviations if needed.","","","","ESM","video games, activity, context",""
+"most_recent_game_plat","Most Recent Game Platform","categorical","","7","Which platform did this session take place on?","Steam; 
+Playstation; 
+Xbox; 
+Nintendo Switch; 
+iOS; 
+Android; 
+Other (text entry)","","","ESM","video games, activity, context",""
+"displaced_activity","Displaced Activity","freetext","","","Think back to your most recent gaming session. If you hadn't played a game, what would you most likely have done instead?","","","","ESM","video games, activity, context",""
+"needs_autonomy_satisfied","Able to Do Valued Things","rating_scale","","7","The next statements tap into your experiences today. Please indicate for each of the statements to what extent they are true for you.Today...
+... I was able to do things that I really want and value in life.","1 = very strongly disagree
+2 = strongly disagree
+3 = disagree
+4 = neither disagree nor agree
+5 = agree
+6 = strongly agree
+7 = very strongly agree","","BPNSFS brief version","ESM","autonomy, self-determination, need satisfaction, basic psychological needs",""
+"needs_autonomy_frustrated","Forced to Do Things","rating_scale","","7","The next statements tap into your experiences today. Please indicate for each of the statements to what extent they are true for you.Today...
+... I felt forced to do many things I wouldn’t choose to do.","1 = very strongly disagree
+2 = strongly disagree
+3 = disagree
+4 = neither disagree nor agree
+5 = agree
+6 = strongly agree
+7 = very strongly agree","","BPNSFS brief version","ESM","self-determination, need frustration, basic psychological needs",""
+"needs_competence_satisfied","Could Do Things Well","rating_scale","","7","The next statements tap into your experiences today. Please indicate for each of the statements to what extent they are true for you.Today...
+... I could do things well and achieve my goals.","1 = very strongly disagree
+2 = strongly disagree
+3 = disagree
+4 = neither disagree nor agree
+5 = agree
+6 = strongly agree
+7 = very strongly agree","","BPNSFS brief version","ESM","competence, need satisfaction, competence satisfaction, mastery, self-efficacy, basic psychological needs",""
+"needs_competence_frustrated","Insecure about Abilities","rating_scale","","7","The next statements tap into your experiences today. Please indicate for each of the statements to what extent they are true for you.Today...
+... I felt insecure about my abilities.","1 = very strongly disagree
+2 = strongly disagree
+3 = disagree
+4 = neither disagree nor agree
+5 = agree
+6 = strongly agree
+7 = very strongly agree","","BPNSFS brief version","ESM","competence, need satisfaction, competence satisfaction, insecurity, self-efficacy, basic psychological needs",""
+"needs_relatedness_satisfied","Felt Close and Connected","rating_scale","","7","The next statements tap into your experiences today. Please indicate for each of the statements to what extent they are true for you.Today...
+... I felt close and connected with other people whom I care about and who care about me.","1 = very strongly disagree
+2 = strongly disagree
+3 = disagree
+4 = neither disagree nor agree
+5 = agree
+6 = strongly agree
+7 = very strongly agree","","BPNSFS brief version","ESM","relatedness, social connectedness, need satisfaction, basic psychological needs",""
+"needs_relatedness_frustrated","Felt Excluded","rating_scale","","7","The next statements tap into your experiences today. Please indicate for each of the statements to what extent they are true for you.Today...
+... I felt excluded from the group I want to belong to.","1 = very strongly disagree
+2 = strongly disagree
+3 = disagree
+4 = neither disagree nor agree
+5 = agree
+6 = strongly agree
+7 = very strongly agree","","BPNSFS brief version","ESM","relatedness, social connectedness, social exclusion, need satisfaction, basic psychological needs",""
+"bpnsfs_dup_item","Duplicated Item","other","","","","","","","ESM","","One BPNSFS was duplicated for attention checking. See the manuscript describing the dataset for more details."
+"bpnsfs_dup_score","Duplicated Item Score","other","","","","","","","ESM","",""
+"bpnsfs_failed_att_check","Failed Attention Check","other","","","","","","","ESM","",""
+"had_stress","Had Stress","binary","","2","Did anything happen to you in the last 24 hours that most people would consider stressful?","Yes
+No","","","ESM","negative event, stress",""
+"stress_events_argument","Argument","categorical","","1","Argument or disagreement","","","","ESM","negative event, stress, argument, social stress, social conflict","Only non-missing when present"
+"stress_events_discrimination","Discrimination","categorical","","1","Discrimination","","","","ESM","negative event, stress, discrimination, social conflict","Only non-missing when present"
+"stress_events_friend_rel","Friend or Relative","categorical","","1","Issue affecting a friend or relative","","","","ESM","negative effent, stress, social stress","Only non-missing when present"
+"stress_events_health","Health","categorical","","1","Health issue","","","","ESM","negative event, stress, physical health","Only non-missing when present"
+"stress_events_home","Home","categorical","","1","Home issue","","","","ESM","negative event, stress","Only non-missing when present"
+"stress_events_other","Other","categorical","","1","Other","","","","ESM","negative event, stress","Only non-missing when present"
+"stress_events_work_school","Work or School","categorical","","1","Work or school issue","","","","ESM","negative event, stress, work, school","Only non-missing when present"
+"how_stressful_argument","How Stressful Argument","rating_scale","","4","How stressful was this stressful event? 
+Argument or disagreement","1 = not at all 
+2 = not very 
+3 = somewhat 
+4 = very","","","ESM","negative event, stress, argument, social stress, social conflict",""
+"how_stressful_discrimination","How Stressful Discrimination","rating_scale","","4","How stressful was this event?
+Discrimination","1 = not at all 
+2 = not very 
+3 = somewhat 
+4 = very","","","ESM","negative event, stress, discrimination, social conflict",""
+"how_stressful_friend_rel","How Stressful Friend or Relative","rating_scale","","4","How stressful was this event?
+Issue affecting a friend or relative","1 = not at all 
+2 = not very 
+3 = somewhat 
+4 = very","","","ESM","negative effent, stress, social stress",""
+"how_stressful_health","How Stressful Health","rating_scale","","4","How stressful was this event?
+Health issue","1 = not at all 
+2 = not very 
+3 = somewhat 
+4 = very","","","ESM","negative event, stress, physical health",""
+"how_stressful_home_issue","How Stressful Home","rating_scale","","4","How stressful was this event?
+Home issue","1 = not at all 
+2 = not very 
+3 = somewhat 
+4 = very","","","ESM","negative event, stress",""
+"how_stressful_other","How Stressful Other","rating_scale","","4","How stressful was this event?
+Other","1 = not at all 
+2 = not very 
+3 = somewhat 
+4 = very","","","ESM","negative event, stress",""
+"how_stressful_work_school","How Stressful Work or School","rating_scale","","4","How stressful was this event?
+Work or school issue","1 = not at all 
+2 = not very 
+3 = somewhat 
+4 = very","","","ESM","negative event, stress, work, school",""
+"affective_valence","Affective Valence","numeric","","101","How are you feeling right now?","","","","ESM","affect, valence",""
+"life_satisfaction","Life Satisfaction","rating_scale","","101","I was satisfied with my life today.","","","","ESM","life satisfaction, well-being",""
+"day_type","Day Type","categorical","","6","Which best describes today for you?","Regular work day
+Regular day off
+Weekend
+Holiday
+Vacation day 
+Other (please specify)","","","ESM","context",""
+"sleep_quality","Sleep Quality","rating_scale","","5","How do you rate the quality of your sleep?
+""Sleep Quality"" is your sense of whether you slept well or poorly.","1 = very poor
+2 = poor
+3 = fair 
+4 = good 
+5 = very good","","","ESM","sleep quality, sleep",""
+"baseline_day","Baseline Day","Date","","","","","","","ESM","",""
+"ideal_baseline_day","Ideal Baseline Day","Date","","","","","","","ESM","",""
+"n_valid","","numeric","","","","","","","ESM","",""
+"original_wave","","other","","","","","","","ESM","",""
