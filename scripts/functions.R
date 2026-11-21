@@ -1,5 +1,5 @@
 # functions.R
-# Shared helpers. Load with source(here::here("R", "functions.R")).
+# Shared helpers. Load with source(here::here("scripts", "functions.R")).
 
 #' Previous-day values, within person, NA when the previous row is not
 #' yesterday.

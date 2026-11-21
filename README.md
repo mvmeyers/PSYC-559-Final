@@ -14,7 +14,7 @@ video game players, one survey a day for up to 30 days, 16,346 person-days.
    ```r
    library(here)
    daily <- readRDS(here("data", "daily_clean.rds"))
-   source(here("R", "functions.R"))   # lag_within_person()
+   source(here("scripts", "functions.R"))   # lag_within_person()
    ```
 
 Both data files are already committed, so you do not need to run the scripts
@@ -24,11 +24,11 @@ to start. Run them to rebuild from scratch.
 
 | Step | Script | Reads | Writes |
 |---|---|---|---|
-| 0 | `R/00_download.R` | openESM (network) | `data/openesm_0075.rds`, `data/codebook_0075.csv` |
-| 1 | `R/01_clean_daily.R` | `data/openesm_0075.rds` | `data/daily_clean.rds` |
-| — | `R/functions.R` | — | helpers, sourced by later scripts |
+| 0 | `scripts/00_download.R` | openESM (network) | `data/openesm_0075.rds`, `data/codebook_0075.csv` |
+| 1 | `scripts/01_clean_daily.R` | `data/openesm_0075.rds` | `data/daily_clean.rds` |
+| — | `scripts/functions.R` | — | helpers, sourced by later scripts |
 
-Run each from the repo root, for example `Rscript R/01_clean_daily.R`. Step 0
+Run each from the repo root, for example `Rscript scripts/01_clean_daily.R`. Step 0
 needs the internet and is only needed if the saved file is missing. The
 analysis (split, recipes, clustering, PCA, models) will go in later numbered
 scripts or one `.Rmd`.
@@ -40,7 +40,7 @@ data/
   openesm_0075.rds     get_dataset("0075") output, saved once (data + metadata)
   codebook_0075.csv    codebook from the metadata element
   daily_clean.rds      the shared daily table (built by 01_clean_daily.R)
-R/
+scripts/
   00_download.R
   01_clean_daily.R
   functions.R

@@ -146,7 +146,7 @@ for (e in sub("stress_events_", "", event_cols)) {
 # 3. Day index helper for lags -------------------------------------------------
 # `day` counts calendar days from the person's first diary day (a gap in `day`
 # always equals the gap in calendar dates), so a lag is valid only when
-# days_since_prev == 1. See lag_within_person() in R/functions.R.
+# days_since_prev == 1. See lag_within_person() in scripts/functions.R.
 daily <- daily %>%
   arrange(id, day) %>%
   group_by(id) %>%
