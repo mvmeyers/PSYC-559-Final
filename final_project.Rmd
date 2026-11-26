@@ -1,0 +1,2753 @@
+---
+title: "PSYC 559 Final Project: Predicting Daily Life Satisfaction on Gaming Days"
+author: "Group 1"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4,
+                      fig.path = "output/figures/")
+```
+
+**How to run this file.** This one file is the whole analysis. Knit it from
+start to finish; no other script has to be run first. It reads four files
+from the `data/` folder next to it:
+
+- `openesm_0075.rds`, the Open Play daily diary from openESM. If it is
+  missing, the `download` chunk downloads and saves it (this needs the
+  internet).
+- `survey_intake.csv.gz`, the Open Play intake survey from the project's
+  repository (<https://github.com/digital-wellbeing/open-play>), which
+  supplies the demographics.
+- `game_classification.csv` and `game_classification_excluded.csv`, the
+  hand-reviewed lookup files that give each game title's genre.
+
+The file cleans the diary, builds the daily table, runs the clustering and
+the principal components, fits every supervised model on feature sets A and
+B, and saves the results to `output/final_results.rds` for the report.
+Fitting the models takes most of the knit time.
+
+**The test set stays locked until the final model is chosen.** The chunks
+that touch the test set only run when `run_test_set` is `TRUE`. Keep it
+`FALSE` while reading the cross-validated comparison (Section 8), then set it
+to `TRUE` for one final knit.
+
+```{r test-switch}
+run_test_set <- TRUE
+```
+
+**Saved model fits.** Each `train()` result is saved to
+`output/model_fits/` as soon as it is fit. If the folder is missing, every
+model is fit from scratch. Later knits read the saved fit instead of
+refitting, so editing the text or the tables does not cost another long run:
+with the saved fits a knit takes a few minutes, and refitting every model
+took about 1.5 hours on a laptop with the folds in parallel. Set
+`refit_models` to `TRUE` (or delete the folder) whenever anything before
+Section 8 changes, and once more for the knit that is submitted (the handout:
+"knit clean before submitting"). The fits are exactly reproducible with the
+same package versions (Section 12), so that knit should give the same
+numbers.
+
+```{r refit-switch}
+refit_models <- FALSE
+```
+
+```{r packages}
+library(openesm)     # get_dataset() and cite()
+library(dplyr)      # data manipulation and the pipe
+library(tidyr)       # pivot_longer()
+library(ggplot2)     # plots
+library(naniar)      # vis_miss() and gg_miss_var()
+library(rsample)     # group_initial_split()
+library(recipes)     # imputation, dummy coding, and scaling inside the pipeline
+library(cluster)     # silhouette()
+library(caret)       # train(), groupKFold(), resamples(), varImp()
+library(glmnet)      # elastic net
+library(ranger)      # random forests
+library(doParallel)  # fits the cross-validation folds in parallel
+
+theme_set(theme_minimal(base_size = 12))
+
+# Every file is read from data/ and written to output/, both in the folder
+# that holds this Rmd. Knitting runs from that folder, and so does running
+# chunks by hand after opening the .Rproj.
+data_path <- function(file) file.path("data", file)
+out_path  <- function(file) file.path("output", file)
+dir.create("output", showWarnings = FALSE)
+```
+
+# 1. Research Questions
+
+**Supervised.** Using same-day predictors and stable person characteristics
+from the intake survey, how well can we predict a player's **life
+satisfaction** on a day they played video games? Life satisfaction is the
+daily item "I was satisfied with my life today," rated on a 0 to 100 slider,
+so the target is **continuous**. The predictors are:
+
+- the six Basic Needs in Games (BANGS) items about the most recent session;
+- the type of game played and who the person played with that day;
+- sleep quality, the type of day, and the platform;
+- whether a stressful event occurred, which kinds, and how stressful the
+  worst one was;
+- six daily basic-needs items (satisfaction and frustration of autonomy,
+  competence, and relatedness);
+- demographics and life circumstances from the intake survey: age, gender,
+  employment, education, relationship status, and caring for children.
+
+Every daily predictor comes from the **same day's** survey as the target, so
+the model describes what goes together on a day. It does not forecast.
+Affective valence ("How are you feeling right now?") is **not** a predictor.
+It is answered in the same sitting and correlates highly with life
+satisfaction (Section 3).
+
+The users are designers of digital well-being tools, such as a check-in at
+the end of a play session that flags players who may be having a bad day.
+
+**Unsupervised.**
+
+- **Dimensions of a day (PCA).** We reduce the six daily basic-needs items. We
+  expect two components, general satisfaction and general frustration, rather
+  than one per need.
+- **Types of play days (K-means).** We cluster the play days on the six
+  BANGS items, which describe the day's most recent gaming session. The
+  proposal expected days built around a "toxic competitive session," a
+  "low improvement session," and a "satisfying solo session."
+
+# 2. Get the Data
+
+## The download
+
+The diary is the `get_dataset("0075")` output, downloaded once and saved to
+`data/openesm_0075.rds`.
+
+```{r download, eval = !file.exists(data_path("openesm_0075.rds"))}
+# only runs if the saved file is missing
+open_play <- get_dataset("0075")
+saveRDS(open_play, data_path("openesm_0075.rds"))
+```
+
+```{r read}
+open_play <- readRDS(data_path("openesm_0075.rds"))
+raw <- open_play$data          # the diary as downloaded
+
+intake <- read.csv(data_path("survey_intake.csv.gz"), stringsAsFactors = FALSE)
+
+# the expected file: one row per person per day
+dim(raw)
+stopifnot(nrow(raw) == 16346, n_distinct(raw$id) == 1284,
+          !anyDuplicated(raw[c("id", "day")]))
+c(people = n_distinct(raw$id))
+```
+
+The citation for the references section:
+
+```{r cite}
+cite(open_play)
+```
+
+## The codebook
+
+The codebook comes with the data, one row per variable. The item wording is
+in `details` and the response codes are in `labels`.
+
+```{r codebook}
+codebook <- open_play$metadata$features[[1]]
+
+codebook %>%
+  filter(name %in% c("gaming_toxic", "needs_autonomy_satisfied",
+                     "life_satisfaction", "sleep_quality",
+                     "how_stressful_health")) %>%
+  mutate(across(c(details, labels), ~ gsub("\n", " ", .x))) %>%
+  select(name, details, labels) %>%
+  knitr::kable()
+```
+
+# 3. Build the Daily Table
+
+## What is in a row
+
+Open Play surveys once a day at 2 PM, so each row is already one person on
+one day (`beep` is always 1). No aggregation is needed and there is no
+minimum-prompts rule. The work is recoding and restricting to play days.
+
+```{r rows}
+table(beep = raw$beep)
+```
+
+## Clean the diary
+
+16,346 days are kept. The cleaning script does the following:
+
+- **Checkboxes to No/Yes factors, with skip-pattern blanks recoded rather
+  than imputed.** The social-play boxes are "No" on days without play. The
+  stress event types are "No" on days without a stressful event.
+- **Summaries.** The four social-play boxes were summarized into
+  `play_context`, and the typed platform answers were grouped into
+  `platform`, each with a "Did not play" level. The rules are listed later
+  in this section.
+- **Stress severity** (four options) is an ordered factor, and `stress_worst`
+  is the highest severity that day.
+- **Swapped columns fixed.** In the source data, the severity ratings for the
+  "health" and "other" events are stored in each other's columns. The
+  cleaning swaps them back.
+- **Type of day.** Holiday and vacation day are combined into one level.
+- **Dropped:**
+  - bookkeeping (`date`, `beep`, `survey_duration`, `baseline_day`,
+    `ideal_baseline_day`, `n_valid`, `original_wave`);
+  - the attention-check and duplicate-item columns for the needs scale;
+  - free text (`most_recent_game`, `displaced_activity`).
+
+```{r clean-daily}
+# 1. The swapped stress ratings. In the source data the "health" and "other"
+# severity ratings sit in each other's columns: every day with the health box
+# checked has its rating in how_stressful_other and none in
+# how_stressful_health, and the reverse holds for "other". Check this, then
+# swap them back. The swap is made on a copy, so raw stays as downloaded.
+swap_check <- c(
+  health_checked_other_rated = sum(!is.na(raw$stress_events_health) & !is.na(raw$how_stressful_other)),
+  health_checked             = sum(!is.na(raw$stress_events_health)),
+  other_checked_health_rated = sum(!is.na(raw$stress_events_other) & !is.na(raw$how_stressful_health)),
+  other_checked              = sum(!is.na(raw$stress_events_other)))
+swap_check
+stopifnot(swap_check[1] == swap_check[2], swap_check[3] == swap_check[4])
+
+src <- raw %>%
+  rename(how_stressful_health = how_stressful_other,
+         how_stressful_other  = how_stressful_health)
+
+# 2. Recode
+yes_no <- function(x) factor(x, levels = c("No", "Yes"))
+
+# A checkbox holds its label when checked and NA when not. On days the
+# question was not shown (no play, no stress), unchecked means "No".
+# `asked` is TRUE when shown, FALSE when skipped by design, and NA when the
+# gate question itself is missing.
+checkbox <- function(x, asked) {
+  factor(ifelse(is.na(asked), NA, ifelse(!is.na(x), "Yes", "No")),
+         levels = c("No", "Yes"))
+}
+
+social_cols <- c("social_singleplayer", "social_friends_realworld",
+                 "social_friends_online", "social_strangers")
+event_cols  <- grep("^stress_events_", names(src), value = TRUE)
+sev_cols    <- grep("^how_stressful_", names(src), value = TRUE)
+sev_levels  <- c("No event", "Not at all", "Not very", "Somewhat", "Very")
+
+daily <- src %>%
+  mutate(
+    played24hr = yes_no(played24hr),
+    had_stress = yes_no(had_stress),
+
+    # who they played with: days without play are "No" for every box; a play
+    # day with no box checked is NA (everyone who played, played with someone
+    # or alone)
+    no_social_box = rowSums(!is.na(across(all_of(social_cols)))) == 0,
+    across(all_of(social_cols), ~ checkbox(.x, asked = played24hr == "Yes")),
+    across(all_of(social_cols), ~ replace(.x, played24hr == "Yes" & no_social_box, NA)),
+
+    # one summary of the social context, with its own level for non-play days
+    play_context = case_when(
+      played24hr == "No" ~ "Did not play",
+      social_strangers == "Yes" &
+        (social_friends_realworld == "Yes" | social_friends_online == "Yes") ~ "Friends + strangers",
+      social_strangers == "Yes" ~ "Strangers only",
+      social_friends_realworld == "Yes" | social_friends_online == "Yes" ~ "Friends only",
+      social_singleplayer == "Yes" ~ "Solo only"),
+    play_context = factor(play_context,
+                          levels = c("Did not play", "Solo only", "Friends only",
+                                     "Friends + strangers", "Strangers only")),
+
+    # platform of the most recent session, grouped; typed "Other" answers
+    # (PC, laptop, Chromebook, ...) stay "Other"
+    platform = case_when(
+      played24hr == "No" ~ "Did not play",
+      most_recent_game_plat == "Steam"       ~ "Steam",
+      most_recent_game_plat == "Xbox"        ~ "Xbox",
+      most_recent_game_plat == "Playstation" ~ "PlayStation",
+      grepl("^Nintendo", most_recent_game_plat) ~ "Nintendo",
+      most_recent_game_plat %in% c("iOS", "Android", "AMAZON TABLET") ~ "Mobile",
+      !is.na(most_recent_game_plat) ~ "Other"),
+    platform = factor(platform, levels = c("Did not play", "Steam", "Xbox",
+                                           "PlayStation", "Nintendo",
+                                           "Mobile", "Other")),
+
+    # stress event types: "No" on days with had_stress = "No"; NA on a "Yes"
+    # day with no type checked (the types are unknown)
+    any_event_box = rowSums(!is.na(across(all_of(event_cols)))) > 0,
+    across(all_of(event_cols), ~ checkbox(.x, asked = had_stress == "Yes")),
+    across(all_of(event_cols), ~ replace(.x, had_stress == "Yes" & !any_event_box, NA)),
+    n_stress_events = rowSums(across(all_of(event_cols), ~ .x == "Yes")),
+
+    # severity (1 to 4 in the source) as an ordered factor with a "No event"
+    # level below "Not at all": four response options, so not numeric
+    worst_raw = suppressWarnings(
+      do.call(pmax, c(across(all_of(sev_cols)), na.rm = TRUE))),
+    across(all_of(sev_cols),
+           ~ factor(ifelse(is.na(had_stress), NA, ifelse(is.na(.x), 0, .x)),
+                    levels = 0:4, labels = sev_levels, ordered = TRUE)),
+    across(all_of(sev_cols), ~ replace(.x, had_stress == "Yes" & !any_event_box, NA)),
+    stress_worst = factor(case_when(
+      had_stress == "No"  ~ 0,
+      had_stress == "Yes" ~ worst_raw),    # NA if "Yes" but nothing rated
+      levels = 0:4, labels = sev_levels, ordered = TRUE),
+
+    # type of day: holiday and vacation day (2 to 3% of days each) both mean a
+    # weekday off, so they are combined
+    day_type = factor(day_type,
+                      levels = c("Regular work day", "Regular day off", "Weekend",
+                                 "Holiday", "Vacation day", "Other (please specify):"),
+                      labels = c("Work day", "Day off", "Weekend",
+                                 "Holiday or vacation", "Holiday or vacation", "Other"))
+    # numeric items stay numbers: gaming_* and needs_* (1 to 7), sleep_quality
+    # (1 to 5), affective_valence and life_satisfaction (0 to 100)
+  )
+
+# an event type that was checked must have a severity rating, and only then
+for (e in sub("stress_events_", "", event_cols)) {
+  sev <- if (e == "home") "how_stressful_home_issue" else paste0("how_stressful_", e)
+  stopifnot(all((daily[[paste0("stress_events_", e)]] == "Yes") ==
+                  (daily[[sev]] > "No event"), na.rm = TRUE))
+}
+
+# 3. Keep the variables, one row per person per day, in id and day order
+daily <- daily %>%
+  arrange(id, day) %>%
+  select(id, day, affective_valence, life_satisfaction, sleep_quality, day_type,
+         played24hr, starts_with("gaming_"), all_of(social_cols), play_context, platform,
+         starts_with("needs_"),
+         had_stress, all_of(event_cols), n_stress_events, all_of(sev_cols), stress_worst)
+
+# the clean table has the same person days as the download
+stopifnot(nrow(daily) == nrow(raw),
+          setequal(paste(daily$id, daily$day), paste(raw$id, raw$day)))
+dim(daily)
+```
+
+The attention check failed on no day, so dropping it loses nothing:
+
+```{r attention-check}
+table(bpnsfs_failed_att_check = raw$bpnsfs_failed_att_check, useNA = "ifany")
+```
+
+## What the analysis adds
+
+**Added back from the download** (joined by `id` and `day`):
+
+- `most_recent_game`, used once to build the game type (below). It is not a
+  predictor.
+- `date`, used only for two checks: platform missingness by month (Section 4)
+  and the intake-timing leakage check (Section 7).
+
+**Left out of the analysis:**
+
+- **Affective valence** ("How are you feeling right now?"). It is answered in
+  the same sitting as life satisfaction and is close to the same thing on a
+  given day (correlation below). A model that used it would mostly translate
+  valence into life satisfaction. It is the target in another form.
+- **`n_stress_events` and the seven individual severity ratings.** The
+  stress information enters as `had_stress`, the seven event types, and the
+  worst rating that day.
+- **The four social-play checkboxes.** They enter through `play_context`.
+- **Lags.** Every predictor here is from the same day, so no lags are built.
+
+```{r valence}
+round(cor(daily$affective_valence, daily$life_satisfaction, use = "complete.obs"), 2)
+```
+
+```{r add-back}
+dat <- daily %>%
+  select(-affective_valence, -n_stress_events, -starts_with("how_stressful_")) %>%
+  left_join(raw %>% select(id, day, date, most_recent_game), by = c("id", "day"))
+
+stopifnot(nrow(dat) == nrow(daily))
+dim(dat)
+```
+
+## Play days only
+
+The six BANGS items are asked only on days the person played in the last 24
+hours. Our question is about play days, so the daily table keeps only those
+days, as the proposal says. Days with a missing answer to the play question
+are dropped with them.
+
+```{r play-days}
+table(played24hr = dat$played24hr, useNA = "always")
+
+# BANGS items exist only on play days
+table(played = dat$played24hr, has_bangs = !is.na(dat$gaming_toxic), useNA = "ifany")
+
+counts <- data.frame(step = "All diary days",
+                     days = nrow(dat), people = n_distinct(dat$id))
+
+# days with no answer to the play question, and how many also lack the target
+played_missing <- c(days      = sum(is.na(dat$played24hr)),
+                    no_target = sum(is.na(dat$played24hr) & is.na(dat$life_satisfaction)))
+played_missing
+
+dat <- dat %>%
+  filter(played24hr %in% "Yes") %>%
+  select(-played24hr) %>%
+  mutate(play_context = droplevels(play_context),   # "Did not play" no longer occurs
+         platform     = droplevels(platform))
+
+counts <- rbind(counts, data.frame(step = "Play days",
+                                   days = nrow(dat), people = n_distinct(dat$id)))
+
+# no play day was left with the non-play levels
+stopifnot(!any(c(levels(dat$play_context), levels(dat$platform)) == "Did not play"))
+```
+
+The `r played_missing[["days"]]` days with no answer to the play question are
+nearly all empty surveys. `r played_missing[["no_target"]]` of them have no
+life satisfaction rating either, so they could not have been used anyway.
+
+**Play days with no gaming answers.** On some play days the person said they
+played, then skipped every gaming question: no title, no social box, no
+platform, and no BANGS item. These days are dropped:
+
+- The question is about what a day of gaming was like, and these days say
+  nothing about it. Every gaming predictor would be imputed, so each day
+  would add filled-in values, not information.
+- They would also be miscoded. A blank title is "Unclassified," and the
+  game-type rules (below) read a missing play context as solo.
+
+```{r no-gaming}
+bangs <- c("gaming_autonomy", "gaming_wish_else", "gaming_progress",
+           "gaming_disappointed", "gaming_relationships", "gaming_toxic")
+needs <- c("needs_autonomy_satisfied", "needs_autonomy_frustrated",
+           "needs_competence_satisfied", "needs_competence_frustrated",
+           "needs_relatedness_satisfied", "needs_relatedness_frustrated")
+
+no_title  <- is.na(dat$most_recent_game) | trimws(dat$most_recent_game) == ""
+no_gaming <- no_title & is.na(dat$play_context) & is.na(dat$platform) &
+             rowSums(!is.na(dat[bangs])) == 0
+
+no_gaming_n <- c(days = sum(no_gaming),
+                 with_target = sum(no_gaming & !is.na(dat$life_satisfaction)))
+no_gaming_n
+
+dat <- dat[!no_gaming, ]
+
+counts <- rbind(counts, data.frame(step = "Play days with gaming answers",
+                                   days = nrow(dat), people = n_distinct(dat$id)))
+counts
+```
+
+`r no_gaming_n[["days"]]` play days had no gaming answers. Only
+`r no_gaming_n[["with_target"]]` of them had a life satisfaction rating, so
+dropping them loses `r no_gaming_n[["with_target"]]` usable days.
+
+## Checking the recoding
+
+**Placeholder codes.** The numeric items are all inside their allowed ranges,
+so there are no codes like 99 or -99:
+
+```{r ranges}
+sapply(dat[c("life_satisfaction", bangs, needs, "sleep_quality")], range, na.rm = TRUE)
+sapply(dat[c("life_satisfaction", bangs, needs, "sleep_quality")], class)
+```
+
+**Ordinal items** follow one rule. An item with five or more ordered
+response options is treated as numeric, and one with fewer is treated as an
+ordered factor.
+
+- The BANGS and needs items (1 to 7) and sleep quality (1 to 5) are numeric.
+- The worst-stressor rating has four options, so it is an ordered factor
+  (below).
+
+**Type of day**, with holiday and vacation already combined:
+
+```{r day-type}
+table(dat$day_type, useNA = "always")
+```
+
+**Who they played with and the platform.** These were summarized in the
+cleaning (Section 3) with these rules:
+
+- play context is friends + strangers, strangers only, friends only, or solo
+  only;
+- iOS and Android are combined as Mobile, and typed "Other" platforms stay
+  Other.
+
+A play day with no social box checked would have a missing play context.
+Every such day also had no other gaming answers and was dropped above, so
+none remain.
+
+```{r play-context}
+table(dat$play_context, useNA = "always")
+table(dat$platform, useNA = "always")
+```
+
+## Type of game
+
+`most_recent_game` is typed free text. We clean each
+title (lowercase, accents removed, punctuation stripped) and look up its
+genre in two files:
+
+- `game_classification.csv`, a hand-reviewed list of titles and genres;
+- `game_classification_excluded.csv`, the titles that were only named on
+  solo days or are single-player games. These were classified by matching
+  patterns in the titles and not reviewed by hand.
+
+Each genre is then coded by **who the other people in the game are**:
+
+- single-player;
+- non-competitive (co-op, MMO, sandbox, casual);
+- individual competition;
+- team competition;
+- unknown.
+
+**On days with other players** (friends, strangers, or both), these rules
+apply:
+
+- Games that can be played either solo or in a squad (Fortnite, PUBG,
+  Warzone), Minecraft, and Roblox are coded from who the person played with:
+  with friends, team competition; strangers only, individual competition.
+- Single-player games with a co-op mode count as non-competitive.
+- Titles neither lookup file can classify are "Unknown."
+
+**On solo-only days, the person's own answer decides.** On a solo-only day the person
+answered "Single-player games only" when asked what kind of social
+interaction they took part in while gaming. Every game on such a day is
+coded **single-player**, whatever its genre in the lookup files. The reasons:
+
+- **The lookup only says what a game can be.** Many games coded as
+  competitive or co-op also have modes played alone or against the computer
+  (Call of Duty, Mario Kart, WWE 2K25, Minecraft, Genshin Impact). The person
+  knows which mode they played. The lookup does not.
+- **The session items are answered from the person's own view of the
+  session.** The BANGS items (relationships, toxicity, disappointment) ask how
+  the most recent session felt. They have to be read in the context the
+  person reported, not in one we assign from the title.
+- **We do not overrule what people said in the survey.** Where the person's
+  description of their gaming day and our classification of the game
+  disagree, the person's description wins.
+- **It also covers titles the lookup cannot classify.** The solo-day titles
+  come from the lookup file that was not reviewed by hand, which leaves many
+  single-player games "Unclassified" (Pokémon Shield, Final Fantasy VII
+  Rebirth, Civilization). And it removes cases where similar games got
+  different codes (College Football 25 as individual competition, College
+  Football 26 as unclassified).
+
+The table after the chunk shows what the genre rules would have given on the
+solo-only days.
+
+```{r game-lookup}
+clean_name <- function(x) {
+  x <- iconv(x, from = "UTF-8", to = "ASCII//TRANSLIT", sub = "")
+  x <- gsub("[^a-z0-9 ]", " ", tolower(x))
+  x <- trimws(gsub("[[:space:]]+", " ", x))
+  x[is.na(x)] <- ""
+  x
+}
+
+# the reviewed list comes first, so its genre wins if a title is in both files
+lookup_cols  <- c("game", "genre", "classified_by")
+genre_lookup <- rbind(
+  read.csv(data_path("game_classification.csv"), stringsAsFactors = FALSE)[, lookup_cols],
+  read.csv(data_path("game_classification_excluded.csv"), stringsAsFactors = FALSE)[, lookup_cols])
+genre_lookup <- genre_lookup[!duplicated(genre_lookup$game), ]
+
+# a title missing from both files stops the knit rather than being guessed
+genre_of <- function(name) {
+  genre <- genre_lookup$genre[match(name, genre_lookup$game)]
+  if (anyNA(genre)) stop("Not in the lookup files: ",
+                         paste(unique(name[is.na(genre)]), collapse = ", "))
+  genre
+}
+
+# answers that name more than one game; each game is classified on its own
+multi_game <- list(
+  "baldurs gate 3 echoes of the plum grove" = c("baldurs gate 3", "echoes of the plum grove"),
+  "btd 6 roblox"                       = c("btd 6", "roblox"),
+  "btd 6 rematch"                      = c("btd 6", "rematch"),
+  "btd 6 warframe roblox"              = c("btd 6", "warframe", "roblox"),
+  "btd 6 warframe roblox terraria"     = c("btd 6", "warframe", "roblox", "terraria"),
+  "dbd roblox"                         = c("dbd", "roblox"),
+  "dead by daylight and roblox"        = c("dead by daylight", "roblox"),
+  "dune awakening erenshor"            = c("dune awakening", "erenshor"),
+  "expedition 33 and fortnite"         = c("expedition 33", "fortnite"),
+  "fallout 4 dead by daylight"         = c("fallout 4", "dead by daylight"),
+  "fornite and rocket league"          = c("fortnite", "rocket league"),
+  "fortnite and avowed"                = c("fortnite", "avowed"),
+  "fortnite and battle teams 2"        = c("fortnite", "battle teams 2"),
+  "fortnite call of duty"              = c("fortnite", "call of duty"),
+  "gta v and schedule 1"               = c("gta v", "schedule 1"),
+  "marvel rivals and roblox"           = c("marvel rivals", "roblox"),
+  "marvel rivals smurfvillage"         = c("marvel rivals", "smurfs village"),
+  "marvel snap supervive"              = c("marvel snap", "supervive"),
+  "minecraft and marvel rivals"        = c("minecraft", "marvel rivals"),
+  "minecraft bf4 nhl 25"               = c("minecraft", "battlefield 4", "nhl"),
+  "minecraft roblox"                   = c("minecraft", "roblox"),
+  "mix of shcedule 1 and game of thrones" = c("schedule 1", "game of thrones"),
+  "nba 2k25 wwe 2k25"                  = c("nba 2k25", "wwe 2k25"),
+  "nhl 25 minecraft and battlefield 4" = c("nhl", "minecraft", "battlefield 4"),
+  "no man s sky deep rock galactic"    = c("no man s sky", "deep rock galactic"),
+  "pokemon go and royal match"         = c("pokemon go", "royal match"),
+  "powerwashing simulator club penguin" = c("powerwash simulator", "club penguin"),
+  "roblox btd 6"                       = c("roblox", "btd 6"),
+  "roblox btd 6 limbus company"        = c("roblox", "btd 6", "limbus company"),
+  "roblox btd 6 osrs"                  = c("roblox", "btd 6", "osrs"),
+  "roblox fortnite"                    = c("roblox", "fortnite"),
+  "sun haven coral island"             = c("sun haven", "coral island"),
+  "sun haven echoes of the plum grove" = c("sun haven", "echoes of the plum grove"),
+  "the walking dead fortnite"          = c("the walking dead", "fortnite"),
+  "word find stud io poker"            = c("word find", "poker"))
+```
+
+```{r game-type}
+code_competition <- function(game_category, play_context) {
+  with_friends <- play_context %in% c("Friends only", "Friends + strangers")
+  with_others  <- with_friends | play_context %in% "Strangers only"
+  case_when(
+    game_category == "Solo or co-op" & with_others ~ "Non-competitive",
+    game_category == "Solo or co-op" ~ "Single-player",
+    game_category == "Competitive team" ~ "Team competition",
+    game_category == "Squad or solo" & with_friends ~ "Team competition",
+    game_category == "Squad or solo" ~ "Individual competition",
+    game_category == "Head-to-head" ~ "Individual competition",
+    game_category %in% c("Online co-op / MMO", "Sandbox / social",
+                         "Casual / mobile") ~ "Non-competitive",
+    game_category %in% c("Minecraft", "Roblox") & with_friends ~ "Team competition",
+    game_category %in% c("Minecraft", "Roblox") & with_others ~ "Individual competition",
+    game_category %in% c("Minecraft", "Roblox") ~ "Non-competitive",
+    game_category == "Mobile (single-player)" ~ "Single-player",
+    game_category == "Single-player" ~ "Single-player",
+    TRUE ~ "Unknown")
+}
+
+# several games named: on days with others, single-player games are dropped;
+# if the games left agree the day gets their code, otherwise "Unknown"
+combine_games <- function(name, play_context) {
+  codes <- unique(code_competition(genre_of(multi_game[[name]]), play_context))
+  with_others <- play_context %in% c("Friends only", "Friends + strangers",
+                                     "Strangers only")
+  if (with_others && any(codes != "Single-player")) {
+    codes <- setdiff(codes, "Single-player")
+  }
+  if (length(codes) == 1) codes else "Unknown"
+}
+
+# code_competition() reads a missing play context as solo, so a missing context
+# is allowed only on days with no title (no gaming answers at all)
+stopifnot(all(clean_name(dat$most_recent_game)[is.na(dat$play_context)] == ""))
+
+dat <- dat %>%
+  mutate(game_clean    = clean_name(most_recent_game),
+         game_category = genre_of(game_clean),
+         game_type     = code_competition(game_category, play_context))
+
+several <- dat$game_category == "Multiple games"
+dat$game_type[several] <- mapply(combine_games, dat$game_clean[several],
+                                 as.character(dat$play_context[several]))
+
+# the solo-day rule: on a "single-player games only" day, every game is
+# single-player. First, what the genre rules alone gave on those days:
+solo_day <- dat$play_context %in% "Solo only"
+solo_rule <- table(genre_rules_gave = dat$game_type[solo_day])
+solo_rule
+dat$game_type[solo_day] <- "Single-player"
+
+dat$game_type <- factor(dat$game_type,
+                        levels = c("Single-player", "Non-competitive",
+                                   "Individual competition", "Team competition",
+                                   "Unknown"))
+
+table(dat$game_type, useNA = "always")
+
+# how the game type lines up with who the person played with
+table(play_context = dat$play_context, game_type = dat$game_type, useNA = "ifany")
+```
+
+Of the `r format(sum(solo_rule), big.mark = ",")` solo-only days, the genre
+rules alone would have given
+`r sum(solo_rule) - solo_rule[["Single-player"]] - solo_rule[["Unknown"]]` a
+competitive or non-competitive code and left
+`r format(solo_rule[["Unknown"]], big.mark = ",")` unknown. The person's
+answer codes them all as single-player. Game type and play context now overlap on
+these days by design, so the importance of the two (Section 9) should be read
+together.
+
+On days with other players, the most recent game can still be a
+single-player game
+(`r sum(dat$game_type == "Single-player" & !dat$play_context %in% "Solo only")`
+days). That is not a contradiction. The play context covers the whole day,
+while the game type describes the most recent session.
+
+## Stress
+
+The stress predictors are:
+
+- `had_stress` ("Did anything happen to you in the last 24 hours that most
+  people would consider stressful?");
+- the seven event types as No/Yes factors;
+- `stress_worst`, the highest severity rating that day, as an ordered factor.
+
+The coding rules:
+
+- **Event types.** "No" on a day the stress question was answered "No."
+  Missing on a day the stress question itself is missing. Otherwise "Yes" if
+  the box was checked and "No" if not.
+- **Worst stressor.**
+  - "None" if there was no stressful event.
+  - Otherwise the highest severity rating, where the scale runs 1 = not at all
+    to 4 = very.
+  - Missing if the person said "Yes" but rated no event.
+  - It is an ordered factor because the scale has only four options.
+
+The group's cleaning (above) built these columns with the same rules. The
+chunk below rebuilds both from the download with the rules above and
+checks that every play day agrees.
+
+```{r stress-check}
+event_cols <- grep("^stress_events_", names(dat), value = TRUE)
+
+# the gate question and the follow-ups agree: every "Yes" has a type checked
+table(had_stress = dat$had_stress,
+      any_type_yes = rowSums(sapply(dat[event_cols], function(x) x == "Yes")) > 0,
+      useNA = "ifany")
+
+# the rules above applied to the download, play days only
+raw_play <- raw[match(paste(dat$id, dat$day), paste(raw$id, raw$day)), ]
+rule_types <- sapply(event_cols, function(v)
+  ifelse(is.na(raw_play$had_stress), NA, ifelse(!is.na(raw_play[[v]]), "Yes", "No")))
+sev   <- as.matrix(raw_play[grep("^how_stressful_", names(raw_play))])
+worst <- suppressWarnings(apply(sev, 1, max, na.rm = TRUE))
+rule_worst <- ifelse(raw_play$had_stress == "No", 0,
+                   ifelse(raw_play$had_stress == "Yes" & rowSums(!is.na(sev)) > 0,
+                          worst, NA))
+
+# same answers on every play day
+stopifnot(identical(unname(rule_types), unname(sapply(dat[event_cols], as.character))))
+stopifnot(identical(as.numeric(rule_worst),
+                    as.numeric(as.integer(dat$stress_worst) - 1)))   # "No event" = 0
+
+table(rules_above = rule_worst, group_cleaning = dat$stress_worst, useNA = "ifany")
+```
+
+The two codings agree on every play day. Two notes on the check:
+
+- **The rule for a "Yes" with no type checked.** The group's cleaning makes
+  the event types missing on such a day, while the rules above code them
+  "No." The
+  first table above shows that no play day has this pattern, so the two
+  rules give the same data here.
+- **The health/other swap.** The swap that the cleaning fixes does not
+  change either column used here. The worst rating is the highest across all
+  seven severity columns, whichever column a rating sits in. The event types
+  come from the checkboxes, not the severity columns.
+
+**Merging "Not at all" into "Not very."** The worst-stressor factor has four
+levels: None < Not very < Somewhat < Very. Only
+`r sum(dat$stress_worst == "Not at all", na.rm = TRUE)` play days have "Not
+at all" as their worst rating. We code those days as "Not very" for three
+reasons:
+
+1. **Two days cannot support a level of their own.** The elastic net would
+   estimate a contrast from two days, which is noise. With ten grouped
+   folds, the level would be missing entirely from most folds' training or
+   held-out data. The forest's smallest leaf is five days, so it could never
+   isolate them.
+2. **"Not very" is the nearest level.** Both mean the event was mild, and the
+   two are neighbors on the ordered scale. Merging neighbors keeps the order
+   that makes the variable ordinal.
+3. **"None" would be wrong.** The person did report a stressful event, and
+   that day's event types say so. Coding the worst rating "None" would
+   contradict those columns on the same day.
+
+The cost is negligible: two days out of
+`r format(nrow(dat), big.mark = ",")`.
+
+```{r stress-recode}
+# shorter names for the event types
+dat <- dat %>%
+  rename(stress_argument       = stress_events_argument,
+         stress_discrimination = stress_events_discrimination,
+         stress_friend_family  = stress_events_friend_rel,
+         stress_health         = stress_events_health,
+         stress_home           = stress_events_home,
+         stress_other          = stress_events_other,
+         stress_work_school    = stress_events_work_school)
+
+stress_types <- c("stress_argument", "stress_discrimination",
+                  "stress_friend_family", "stress_health", "stress_home",
+                  "stress_work_school", "stress_other")
+
+# four levels; the duplicated label merges "Not at all" into "Not very"
+dat$stress_worst <- factor(as.character(dat$stress_worst),
+                           levels = c("No event", "Not at all", "Not very",
+                                      "Somewhat", "Very"),
+                           labels = c("None", "Not very", "Not very",
+                                      "Somewhat", "Very"),
+                           ordered = TRUE)
+
+table(dat$stress_worst, useNA = "always")
+
+# share of play days with each kind of event
+sapply(dat[stress_types], function(x) round(100 * mean(x == "Yes", na.rm = TRUE), 1))
+```
+
+## Person characteristics from the intake survey
+
+The intake survey came before the diary. The demographics are coded as
+follows:
+
+- **Age** is in years.
+- **Gender** is man, woman, or non-binary / gender diverse. Typed answers are
+  coded by the identity they state.
+- **Employment** is full-time, part-time or self-employed, student, or not
+  employed.
+- **Education** is the highest level completed, numeric 1 to 6 (six ordered
+  levels).
+- **Relationship status** is single, partnered, or divorced / separated /
+  widowed.
+- **Cares for children** is yes if that caregiving box was checked, and no if
+  the person answered the question without checking it.
+
+"Prefer not to say" is a non-answer and becomes missing (Section 4).
+
+```{r intake}
+blank_na <- function(x) { x <- trimws(x); x[x == ""] <- NA; x }
+
+emp <- tolower(blank_na(intake$employment))
+ms  <- tolower(blank_na(intake$marital_status))
+edu <- blank_na(intake$edu_level)
+
+care_cols <- c("care_children", "care_elderly", "care_disability",
+               "care_none", "care_other")
+answered_care <- rowSums(!is.na(intake[care_cols]) & intake[care_cols] != "") > 0
+
+person <- data.frame(
+  id  = intake$pid,
+  age = intake$age,
+  gender = case_when(
+    intake$gender %in% c("Man", "Transgender Man", "Transgender Man (FTM)") ~ "Man",
+    intake$gender %in% c("Woman", "trans woman") ~ "Woman",
+    intake$gender == "Prefer not to say" | is.na(blank_na(intake$gender)) ~ NA_character_,
+    TRUE ~ "Non-binary / gender diverse"),
+  employment = case_when(
+    is.na(emp) | grepl("prefer not", emp)              ~ NA_character_,
+    grepl("student", emp)                               ~ "Student",
+    emp %in% c("working full-time", "military")         ~ "Full-time",
+    emp == "working part-time" |
+      grepl("self|freelanc|gig|streamer|prolific", emp) ~ "Part-time / self-employed",
+    TRUE                                                ~ "Not employed"),
+  education = case_when(
+    edu %in% c("Less than a high school diploma or equivalent",
+               "Completed Primary School")                    ~ 1,
+    edu %in% c("High school graduate or equivalent",
+               "Completed Secondary School")                  ~ 2,
+    edu %in% c("Some college but no degree",
+               "Some University but no degree",
+               "Vocational or Similar")                       ~ 3,
+    edu == "Associate degree"                                 ~ 4,
+    edu %in% c("Bachelor's degree", "University Bachelors Degree") ~ 5,
+    edu %in% c("Master's degree, professional degree, or doctoral degree",
+               "Graduate or professional degree (MA, MS, MBA, PhD, etc)") ~ 6,
+    TRUE                                                      ~ NA_real_),
+  relationship = case_when(
+    is.na(ms) | ms == "prefer not to say"                     ~ NA_character_,
+    ms == "single, never married"                             ~ "Single",
+    grepl("divorc|widow|^separated", ms)                      ~ "Divorced / separated / widowed",
+    grepl("married|partner|engaged|relationship|living with|civil union", ms) ~ "Partnered",
+    TRUE                                                      ~ NA_character_),
+  cares_for_children = case_when(
+    !is.na(intake$care_children) & intake$care_children != "" ~ "Yes",
+    answered_care                                             ~ "No",
+    TRUE                                                      ~ NA_character_),
+  intake_date = intake$date,
+  stringsAsFactors = FALSE) %>%
+  filter(id %in% dat$id)
+
+# one intake record per person, so the join cannot duplicate days
+stopifnot(!anyDuplicated(person$id))
+
+# every typed answer and where it went, for the people in the daily table
+in_dat <- intake$pid %in% dat$id
+table(intake$employment[in_dat], person$employment[match(intake$pid[in_dat], person$id)],
+      useNA = "ifany")
+table(intake$marital_status[in_dat], person$relationship[match(intake$pid[in_dat], person$id)],
+      useNA = "ifany")
+```
+
+```{r intake-join}
+n_before <- nrow(dat)
+
+dat <- dat %>%
+  left_join(person, by = "id") %>%
+  mutate(gender       = factor(gender, levels = c("Man", "Woman",
+                                                  "Non-binary / gender diverse")),
+         employment   = factor(employment, levels = c("Full-time",
+                                                      "Part-time / self-employed",
+                                                      "Student", "Not employed")),
+         relationship = factor(relationship, levels = c("Single", "Partnered",
+                                                        "Divorced / separated / widowed")),
+         cares_for_children = factor(cares_for_children, levels = c("No", "Yes")))
+
+stopifnot(nrow(dat) == n_before)
+
+# people in the daily table with no intake record
+c(people_without_intake = sum(!unique(dat$id) %in% intake$pid))
+```
+
+## The daily table
+
+```{r select-vars}
+day_preds <- c("game_type", "play_context", "platform", "sleep_quality",
+               "day_type", "had_stress", stress_types, "stress_worst")
+person_preds <- c("age", "gender", "employment", "education", "relationship",
+                  "cares_for_children")
+
+days <- dat[c("id", "day", "date", "intake_date", "life_satisfaction",
+              bangs, needs, day_preds, person_preds)]
+
+dim(days)
+str(days)
+```
+
+`id`, `day`, `date`, and `intake_date` are kept only to split by person and
+to check leakage. They are removed before any model sees the data.
+
+# 4. Missing Data
+
+```{r vis-miss, fig.width = 10, fig.height = 6, fig.cap = "Missing values in the daily table. Black cells are missing."}
+model_vars <- c("life_satisfaction", bangs, needs, day_preds, person_preds)
+
+vis_miss(days[model_vars], warn_large_data = FALSE) +
+  theme(plot.margin = margin(t = 25, r = 60), axis.text.x = element_text(size = 7))
+```
+
+```{r gg-miss-var, fig.height = 6, fig.cap = "Percent missing for the target and each predictor."}
+gg_miss_var(days[model_vars], show_pct = TRUE)
+```
+
+```{r pct-missing}
+miss_table <- data.frame(
+  variable    = model_vars,
+  n_missing   = colSums(is.na(days[model_vars])),
+  pct_missing = round(100 * colMeans(is.na(days[model_vars])), 2),
+  row.names   = NULL)
+miss_table[order(-miss_table$pct_missing), ]
+```
+
+## Why are they missing?
+
+**Platform** is the only daily variable with substantial missingness. It is
+missing almost entirely in the first months of the study, which suggests the question was added to the survey partway through:
+
+```{r platform-by-month}
+days %>%
+  mutate(month = format(date, "%Y-%m")) %>%
+  group_by(month) %>%
+  summarise(days = n(),
+            pct_platform_missing = round(100 * mean(is.na(platform)), 1),
+            mean_life_sat = round(mean(life_satisfaction, na.rm = TRUE), 1))
+```
+
+```{r platform-target}
+platform_target <- days %>%
+  group_by(platform_missing = is.na(platform)) %>%
+  summarise(days = n(),
+            mean_life_sat = round(mean(life_satisfaction, na.rm = TRUE), 1))
+platform_target
+```
+
+Missing platform depends on **when** someone took part, which is an observed
+fact, and not on their life satisfaction. Mean life satisfaction is
+`r platform_target$mean_life_sat[platform_target$platform_missing]` on days
+with platform missing and
+`r platform_target$mean_life_sat[!platform_target$platform_missing]` on days
+with it recorded, so the gap does not mark a different kind of day. So it is
+most likely **MAR**, and KNN imputation inside the recipe fits that
+mechanism.
+
+```{r platform-person}
+# missing platform days, by whether the person gave a platform on other days
+platform_gap <- days %>%
+  group_by(id) %>%
+  mutate(answered_other_days = any(!is.na(platform))) %>%
+  ungroup() %>%
+  filter(is.na(platform)) %>%
+  count(answered_other_days)
+platform_gap
+
+# share of each person's answered days on their usual platform
+# (people with 5 or more answered days)
+usual_platform <- days %>%
+  filter(!is.na(platform)) %>%
+  group_by(id) %>%
+  filter(n() >= 5) %>%
+  summarise(share = max(table(platform)) / n())
+round(mean(usual_platform$share), 2)
+```
+
+**A limitation.** KNN fills each missing platform from similar days of
+other people. It does not look at the person's own answers on other days.
+`r platform_gap$n[platform_gap$answered_other_days]` of the
+`r sum(platform_gap$n)` missing days belong to people who gave a platform on
+other days, and people played on their usual platform on
+`r round(100 * mean(usual_platform$share))`% of their days. For those days,
+the person's usual platform would likely be a better guess. We keep KNN, so
+that platform is imputed like every other predictor.
+
+**The intake variables** are missing for two reasons:
+
+- **The person has no intake record.** The most likely cause is a gap in
+  linking the two surveys, which would be close to MCAR.
+- **The person chose "Prefer not to say."** This could be **MNAR**, because
+  someone may decline a question because of their answer.
+
+```{r intake-missing}
+# people in the daily table, by why each intake answer is missing
+said_prefer_not <- function(answers) grepl("prefer not", tolower(answers))
+in_person <- match(person$id, intake$pid)
+care_prefer_not <- !is.na(intake$care_prefer_not_say[in_person]) &
+                   intake$care_prefer_not_say[in_person] != ""
+
+intake_missing <- data.frame(
+  variable         = person_preds,
+  no_intake_record = n_distinct(days$id[!days$id %in% intake$pid]),
+  declined         = c(age          = 0,
+                       gender       = sum(said_prefer_not(intake$gender[in_person])),
+                       employment   = sum(said_prefer_not(intake$employment[in_person])),
+                       education    = sum(said_prefer_not(intake$edu_level[in_person])),
+                       relationship = sum(said_prefer_not(intake$marital_status[in_person])),
+                       cares_for_children = sum(is.na(person$cares_for_children) & care_prefer_not)),
+  row.names = NULL)
+# an intake record, no answer, and no "Prefer not to say": the question was skipped
+intake_missing$skipped <- colSums(is.na(person[person_preds])) - intake_missing$declined
+stopifnot(intake_missing$skipped >= 0)
+intake_missing
+```
+
+Most missing intake values come from the
+`r intake_missing$no_intake_record[1]` people with no intake record. Only
+`r with(intake_missing[-1, ], min(declined + skipped))` to
+`r with(intake_missing, max(declined + skipped))` people declined or skipped
+any one question, so the part that could be MNAR is small.
+
+So the categorical intake variables get their own "Not reported" level
+instead of being imputed. Age and education are filled with the training
+median inside the recipe. Both are person-level facts, so every day of a
+person gets the same value, which KNN would not guarantee. For the people
+with no intake record, the "Not reported" levels already mark them as
+missing, so the median does not hide that. Only the
+`r intake_missing$declined[intake_missing$variable == "education"]` people who
+declined the education question are filled without such a marker.
+
+```{r daily-missing}
+daily_vars <- c(bangs, needs, "sleep_quality", "day_type", "play_context",
+                "had_stress", stress_types, "stress_worst")
+max_daily_missing <- max(miss_table$n_missing[miss_table$variable %in% daily_vars])
+
+# each block is missing all at once: 0 or 6 items on every day
+table(bangs_missing = rowSums(is.na(days[bangs])))
+table(needs_missing = rowSums(is.na(days[needs])))
+```
+
+**The daily items** (the BANGS items, the needs items, sleep, stress, type of
+day, play context) are each missing on `r max_daily_missing` play days or
+fewer (`r round(100 * max_daily_missing / nrow(days), 1)`%). A day missing
+one BANGS item is missing all six, and the same holds for the needs items.
+These are unfinished surveys. Leaving a survey unfinished is unlikely to
+depend on the answers never given, so these are close to **MCAR**. They are
+imputed with KNN inside the recipe. KNN fills each column on its own, so on
+an imputed day the stress columns may not agree with each other (for
+example, `had_stress` "No" with an event type "Yes"). This can happen on at
+most `r miss_table$n_missing[miss_table$variable == "had_stress"]` days.
+
+**The worst stressor** would also be missing on a day the person said "Yes"
+but rated no event.
+`r sum(days$had_stress == "Yes" & is.na(days$stress_worst), na.rm = TRUE)`
+play days have that pattern, so it is missing only when the stress question
+itself is missing.
+
+## Decisions
+
+```{r drop-target}
+c(missing_target = sum(is.na(days$life_satisfaction)))
+
+days <- days %>% filter(!is.na(life_satisfaction))
+
+counts <- rbind(counts, data.frame(step = "Play days with a target",
+                                   days = nrow(days), people = n_distinct(days$id)))
+counts
+
+# days complete on every predictor, counted before the "Not reported" levels
+# are added (afterwards those days would look complete)
+c(complete_days = sum(complete.cases(days[model_vars])))
+
+not_reported <- function(x) {
+  factor(ifelse(is.na(x), "Not reported", as.character(x)),
+         levels = c(levels(x), "Not reported"))
+}
+for (v in c("gender", "employment", "relationship", "cares_for_children")) {
+  days[[v]] <- not_reported(days[[v]])
+}
+
+sapply(days[c("gender", "employment", "relationship", "cares_for_children")], table)
+```
+
+**Summary: how each kind of missing value is handled.**
+
+| What is missing | Variables | Handling | Where and when | Why |
+|---|---|---|---|---|
+| Question skipped by design | social boxes on non-play days; stress types and severity when `had_stress` is No | Recoded to "No" / "No event", not imputed | Cleaning (Section 3) | The answer is known from the skip pattern |
+| The play question | `played24hr` | Day dropped | Section 3 | Cannot tell whether it is a play day; nearly all are empty surveys |
+| Every gaming answer on a play day | title, social boxes, platform, and all BANGS items | Day dropped | Section 3 | The day says nothing about the session |
+| The target | `life_satisfaction` | Day dropped | Section 4, before the split | Nothing to train on or score |
+| An unreadable or conflicting game title | `game_type` | "Unknown" level | Section 3 | A real category of answer, not a gap |
+| A categorical intake answer | gender, employment, relationship, cares for children | "Not reported" level | Section 4, before the split | Declining may depend on the answer (MNAR); the level keeps that information |
+| A numeric intake answer | age, education | Training median | Model recipes (Section 8), relearned in each fold | A fact about the person, so every day of a person gets the same value |
+| A daily answer, in the models | BANGS items, needs items (set A), sleep, type of day, platform, `had_stress`, stress types, `stress_worst` | KNN, 5 neighbors, from the other predictors (never the target) | Model recipes (Section 8), relearned in each fold | Unfinished surveys (MCAR) and the late-added platform question (MAR) |
+| A BANGS or needs block, before clustering and PCA | the 6 BANGS items, the 6 needs items | Training median | Block recipes (Section 6), learned once on the training days | The blocks must be filled first, and a day missing one item misses all six, so KNN has nothing to match on |
+| Cluster and component scores | `play_day_type`, `need_satisfaction`, `need_frustration` | Nothing missing | Section 6 | Built from the already-filled blocks |
+
+**The life satisfaction slider.** The values 0, 50, and 100 are kept as real
+answers:
+
+```{r target-distribution, fig.height = 3.5, fig.cap = "Life satisfaction on play days."}
+summary(days$life_satisfaction)
+
+ggplot(days, aes(life_satisfaction)) +
+  geom_histogram(binwidth = 2) +
+  labs(x = "Life satisfaction today (0 to 100)", y = "Days")
+```
+
+## The variable table
+
+```{r variable-table}
+pm <- function(v) paste0(miss_table$pct_missing[miss_table$variable == v], "%")
+bangs_stem <- "\"In my most recent session of [game]...\" "
+needs_stem <- "\"Today...\" "
+agree7 <- " (1 to 7, strongly disagree to strongly agree)"
+stress_stem <- "\"What kind of stressful event(s) occurred?\" Checkbox: "
+
+var_table <- tibble::tribble(
+  ~variable, ~source, ~item, ~treatment, ~daily_summary, ~missing,
+  "life_satisfaction (target)", "daily", "\"I was satisfied with my life today.\" 0 to 100 slider", "Continuous target", "as rated (same day)", paste0(pm("life_satisfaction"), "; rows dropped"),
+  "gaming_autonomy", "daily, play days", paste0(bangs_stem, "\"I could play in the way I wanted.\"", agree7), "Numeric; clustering block", "as rated, most recent session", paste0(pm("gaming_autonomy"), "; KNN"),
+  "gaming_wish_else", "daily, play days", paste0(bangs_stem, "\"I often found myself wishing I could do something else.\"", agree7), "Numeric; clustering block", "as rated, most recent session", paste0(pm("gaming_wish_else"), "; KNN"),
+  "gaming_progress", "daily, play days", paste0(bangs_stem, "\"I felt that I made progress while playing.\"", agree7), "Numeric; clustering block", "as rated, most recent session", paste0(pm("gaming_progress"), "; KNN"),
+  "gaming_disappointed", "daily, play days", paste0(bangs_stem, "\"I felt disappointed with my performance.\"", agree7), "Numeric; clustering block", "as rated, most recent session", paste0(pm("gaming_disappointed"), "; KNN"),
+  "gaming_relationships", "daily, play days", paste0(bangs_stem, "\"I felt I formed relationships with other players and/or characters.\"", agree7), "Numeric; clustering block", "as rated, most recent session", paste0(pm("gaming_relationships"), "; KNN"),
+  "gaming_toxic", "daily, play days", paste0(bangs_stem, "\"Interactions with other players and/or characters felt toxic to me.\"", agree7), "Numeric; clustering block", "as rated, most recent session", paste0(pm("gaming_toxic"), "; KNN"),
+  "needs_autonomy_satisfied", "daily", paste0(needs_stem, "\"...I was able to do things that I really want and value in life.\"", agree7), "Numeric; PCA block", "as rated (same day)", paste0(pm("needs_autonomy_satisfied"), "; KNN"),
+  "needs_autonomy_frustrated", "daily", paste0(needs_stem, "\"...I felt forced to do many things I wouldn't choose to do.\"", agree7), "Numeric; PCA block", "as rated (same day)", paste0(pm("needs_autonomy_frustrated"), "; KNN"),
+  "needs_competence_satisfied", "daily", paste0(needs_stem, "\"...I could do things well and achieve my goals.\"", agree7), "Numeric; PCA block", "as rated (same day)", paste0(pm("needs_competence_satisfied"), "; KNN"),
+  "needs_competence_frustrated", "daily", paste0(needs_stem, "\"...I felt insecure about my abilities.\"", agree7), "Numeric; PCA block", "as rated (same day)", paste0(pm("needs_competence_frustrated"), "; KNN"),
+  "needs_relatedness_satisfied", "daily", paste0(needs_stem, "\"...I felt close and connected with other people whom I care about and who care about me.\"", agree7), "Numeric; PCA block", "as rated (same day)", paste0(pm("needs_relatedness_satisfied"), "; KNN"),
+  "needs_relatedness_frustrated", "daily", paste0(needs_stem, "\"...I felt excluded from the group I want to belong to.\"", agree7), "Numeric; PCA block", "as rated (same day)", paste0(pm("needs_relatedness_frustrated"), "; KNN"),
+  "game_type", "daily (engineered)", "Type of the most recent game, coded from the typed title and the day's play context; every game on a solo-only day is single-player (the person's answer)","5-level factor: single-player, non-competitive, individual competition, team competition, unknown", "most recent session", "0%",
+  "play_context", "daily (engineered)", "\"While gaming today, what kind of social interaction did you take part in?\" Four checkboxes", "4-level factor: solo only, friends only, friends + strangers, strangers only", "whole day", paste0(pm("play_context"), " (days with no gaming answers dropped)"),
+  "platform", "daily", "\"Which platform did this session take place on?\"", "6-level factor (iOS + Android = Mobile; typed answers = Other)", "most recent session", paste0(pm("platform"), "; KNN"),
+  "sleep_quality", "daily", "\"How do you rate the quality of your sleep?\" 1 = very poor to 5 = very good", "Numeric", "last night (same-day survey)", paste0(pm("sleep_quality"), "; KNN"),
+  "day_type", "daily", "\"Which best describes today for you?\"", "5-level factor (holiday and vacation combined)", "as reported", paste0(pm("day_type"), "; KNN"),
+  "had_stress", "daily", "\"Did anything happen to you in the last 24 hours that most people would consider stressful?\"", "No/Yes factor", "last 24 hours", paste0(pm("had_stress"), "; KNN"),
+  "stress_argument ... stress_other (7)", "daily (engineered)", paste0(stress_stem, "argument, discrimination, friend or relative, health, home, work or school, other"), "No/Yes factors; No when had_stress = No", "last 24 hours", paste0("up to ", pm("stress_argument"), "; KNN"),
+  "stress_worst", "daily (engineered)", "\"How stressful was this event?\" asked for each event, 1 = not at all to 4 = very", "Ordered factor: None < Not very < Somewhat < Very (highest rating; the 2 \"Not at all\" days coded Not very)", "maximum over the day's events", paste0(pm("stress_worst"), "; KNN"),
+  "age", "intake", "\"What is your age in years?\"", "Numeric", "person-level", paste0(pm("age"), "; median"),
+  "gender", "intake", "\"What gender do you identify with?\"", "Factor: man, woman, non-binary / gender diverse, not reported", "person-level", paste0(pm("gender"), "; \"Not reported\" level"),
+  "employment", "intake", "\"What best describes your employment status over the last three months?\"", "Factor: full-time, part-time / self-employed, student, not employed, not reported", "person-level", paste0(pm("employment"), "; \"Not reported\" level"),
+  "education", "intake", "\"What is the highest level of education you have completed?\"", "Numeric 1 to 6", "person-level", paste0(pm("education"), "; median"),
+  "relationship", "intake", "\"What is your current marital status?\"", "Factor: single, partnered, divorced / separated / widowed, not reported", "person-level", paste0(pm("relationship"), "; \"Not reported\" level"),
+  "cares_for_children", "intake", "\"Do you have any caregiving responsibilities?\" Checkbox: I care for children", "Factor: no, yes, not reported", "person-level", paste0(pm("cares_for_children"), "; \"Not reported\" level"),
+  "need_satisfaction, need_frustration (set B)", "engineered", "Varimax-rotated principal component scores of the six needs items (Section 6b)", "Numeric; weights fit on training days, applied to test days", "same day", "0% (block imputed first)",
+  "play_day_type (set B)", "engineered", "K-means cluster (K = 3) of the six BANGS items (Section 6a): smooth solo, connected, frustrating play day", "Factor; centroids fit on training days, test days get the nearest centroid", "most recent session", "0% (block imputed first)",
+  "affective_valence", "removed", "\"How are you feeling right now?\"", "Removed: the target in another form", "-", "-",
+  "id, day, date", "removed", "Participant ID, study day, timestamp", "Removed (id used only to split by person)", "-", "-"
+)
+
+knitr::kable(var_table)
+```
+
+# 5. Split by Person
+
+```{r repeated-measures}
+days_per_person <- table(days$id)
+summary(as.vector(days_per_person))
+
+# share of life satisfaction variance between people (one-way ANOVA ICC)
+aov_fit <- anova(lm(life_satisfaction ~ factor(id), data = days))
+ms_b  <- aov_fit["factor(id)", "Mean Sq"]
+ms_w  <- aov_fit["Residuals", "Mean Sq"]
+k_avg <- (nrow(days) - sum(days_per_person^2) / nrow(days)) / (length(days_per_person) - 1)
+icc   <- (ms_b - ms_w) / (ms_b + (k_avg - 1) * ms_w)
+round(icc, 2)
+```
+
+About `r round(100 * icc)`% of the variation in daily life satisfaction lies
+between people. The intake predictors are also constant within a person. A
+split over days would put most people in both sets. A model could then learn
+each person's usual level from their training days, partly through the intake
+variables, and score well on the test set without predicting anything new.
+
+So we depart from the handout's day-level `initial_split()`, as the proposal
+says, and split by **person**:
+
+- `group_initial_split()` puts 70% of people in the training set and 30% in
+  the test set, with seed 559.
+- The split is stratified on each person's mean life satisfaction (quartiles).
+  This is the person-level version of "stratified on the target."
+- Cross-validation also holds out whole people.
+
+The test set therefore checks how well the model does for **new players**.
+
+```{r split}
+person_ls <- tapply(days$life_satisfaction, days$id, mean)
+days$ls_strata <- cut(person_ls[as.character(days$id)],
+                      breaks = quantile(person_ls, probs = seq(0, 1, 0.25)),
+                      include.lowest = TRUE, labels = FALSE)
+
+set.seed(559)
+split <- group_initial_split(days, group = id, prop = 0.7, strata = ls_strata)
+train <- training(split)
+test  <- testing(split)
+
+split_sizes <- data.frame(
+  set    = c("training", "test"),
+  days   = c(nrow(train), nrow(test)),
+  people = c(n_distinct(train$id), n_distinct(test$id)),
+  mean_life_sat = round(c(mean(train$life_satisfaction), mean(test$life_satisfaction)), 1),
+  sd_life_sat   = round(c(sd(train$life_satisfaction), sd(test$life_satisfaction)), 1))
+split_sizes
+
+# no person is in both sets
+length(intersect(train$id, test$id))
+```
+
+From here on, `test` is used only to receive the cluster labels and component
+scores learned on `train`, until the final evaluation in Section 9.
+
+```{r folds}
+n_folds <- 10
+
+set.seed(559)
+folds <- groupKFold(train$id, k = n_folds)
+
+# The folds are fit in parallel (Section 8), so set.seed() alone would not
+# fix the random parts of each fit (the forests' bootstrap samples).
+# caret takes one seed per fold and tuning value, plus one for the final fit.
+# 1000 per fold covers every tuning grid used here.
+fold_seeds <- c(lapply(seq_len(n_folds), function(i) sample.int(1e6, 1000)),
+                list(sample.int(1e6, 1)))
+ctrl  <- trainControl(method = "cv", number = n_folds, index = folds,
+                      savePredictions = "final", seeds = fold_seeds)
+
+# people and days held out in each fold
+sapply(folds, function(rows) c(people_out = n_distinct(train$id[-rows]),
+                               days_out   = nrow(train) - length(rows)))
+```
+
+The handout asks us to state the number of folds. We use **`r n_folds`
+grouped folds**, the number the handout asks for in the report ("use ten in
+your report"). Each fold holds out
+about a tenth of the training people.
+All models (Section 8) get these same folds through `index`.
+
+# 6. Unsupervised Analysis
+
+Everything in this section is fit on the **training days only**. Test days
+get their cluster labels and component scores from the training fit.
+Neither block contains the target. Both are imputed (training medians) and
+centered and scaled (training means and SDs) in a recipe first, because
+K-means and PCA work from distances and cannot take missing values. Both
+blocks are 1 to 7 numeric items, so there are no categorical items to
+encode.
+
+**Why the blocks are filled with the median here, but with KNN in the
+models.**
+
+- **The blocks must be filled first.** K-means and PCA cannot run with
+  missing values, and they are run once, here, before any model.
+- **KNN has nothing to work with inside a block.** KNN fills a missing
+  answer by finding days with similar answers to the other questions. But a
+  day missing one item of a block is missing all six (Section 4), so within
+  the block there are no other answers to compare. The training median is
+  the simple fill that is left.
+- **The models are different.** Their recipes (Section 8) see every
+  predictor, so KNN has plenty to match on there, and caret relearns it in
+  each fold.
+- **No leakage.** The medians come from the training days only and never
+  use the target.
+- **Small cost.** Every filled day gets the same values: the same play-day
+  type and the same two component scores (shown below). Only
+  `r sum(rowSums(is.na(train[bangs])) > 0)` training and
+  `r sum(rowSums(is.na(test[bangs])) > 0)` test days are filled for the
+  BANGS items, and `r sum(rowSums(is.na(train[needs])) > 0)` training and
+  `r sum(rowSums(is.na(test[needs])) > 0)` test days for the needs items.
+  The effect on the structure and on set B is negligible.
+
+## 6a. Clustering: types of play days
+
+The handout asks for clusters that are types of days. Each play day is
+clustered on its six BANGS answers, which describe how that day's most
+recent gaming session went, so each type is a kind of play day defined by
+its gaming. Days without play have no BANGS answers and no type.
+
+### The block
+
+```{r bangs-recipe}
+rec_bangs <- recipe(~ ., data = train[bangs]) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  prep()
+
+train_bangs <- bake(rec_bangs, new_data = train)
+test_bangs  <- bake(rec_bangs, new_data = test)
+
+round(cor(train_bangs), 2)
+```
+
+Autonomy and progress go together, and wishing to do something else,
+disappointment, and toxicity go together. Forming relationships is nearly
+independent of the rest.
+
+### How many types?
+
+We use two criteria: the **elbow** in the total within-cluster sum of
+squares, and the **average silhouette width**. Each K-means fit uses 25
+random starts. The silhouette is computed from the distances between all
+training days.
+
+```{r choose-k}
+k_range <- 1:8
+
+km_fits <- lapply(k_range, function(k) {
+  set.seed(559)
+  kmeans(train_bangs, centers = k, nstart = 25, iter.max = 50)
+})
+
+bangs_dist <- dist(train_bangs)
+k_choice <- data.frame(
+  K   = k_range,
+  wss = sapply(km_fits, `[[`, "tot.withinss"),
+  silhouette = c(NA, sapply(km_fits[-1], function(km)
+    mean(silhouette(km$cluster, bangs_dist)[, 3]))))
+rm(bangs_dist)
+
+k_choice %>% mutate(share_of_k1 = round(wss / wss[1], 3),
+                    silhouette  = round(silhouette, 3))
+```
+
+```{r elbow-plot, fig.height = 3.2, fig.cap = "Elbow plot: total within-cluster sum of squares by K (training days)."}
+ggplot(k_choice, aes(K, wss)) + geom_point() + geom_line() +
+  scale_x_continuous(breaks = k_range) +
+  labs(y = "Total within-cluster sum of squares")
+```
+
+```{r silhouette-plot, fig.height = 3.2, fig.cap = "Average silhouette width by K (training days)."}
+ggplot(filter(k_choice, K > 1), aes(K, silhouette)) + geom_point() + geom_line() +
+  scale_x_continuous(breaks = k_range) +
+  labs(y = "Average silhouette width")
+```
+
+**Choosing K.** Both criteria point to the same region, and neither gives a
+sharp answer:
+
+- The silhouette is highest at K = 2
+  (`r round(k_choice$silhouette[2], 2)`). It is
+  `r round(k_choice$silhouette[3], 2)` at K = 3 and stays near that value
+  for every larger K. Silhouettes around 0.2 to 0.3 mean the types overlap.
+  Play days vary continuously and do not fall into separate groups.
+- The elbow bends at K = 2 to 3. Going from 1 to 2 clusters removes
+  `r round(100 * (1 - k_choice$wss[2] / k_choice$wss[1]))`% of the
+  within-cluster variation, 2 to 3 removes another
+  `r round(100 * (k_choice$wss[2] - k_choice$wss[3]) / k_choice$wss[1])`%,
+  and later steps remove less.
+
+We keep **K = 3**:
+
+- **Against K = 2.** K = 2 only separates good play days from bad ones.
+  K = 3 splits the good days by whether the person formed relationships
+  while playing. That is the one BANGS item the others do not capture (the
+  correlation table above), and the split matters for the target (below).
+- **Against K = 4.** K = 4 is a finer cut. It splits the frustrating days
+  further, but its silhouette is no better and the solution is less stable.
+- Section 8 checks K = 2 and K = 4 against K = 3 on the training folds:
+  profiles, stability, and prediction.
+
+```{r k-final}
+k_final <- 3
+km <- km_fits[[k_final]]
+
+km$size
+round(km$betweenss / km$totss, 2)   # share of variation between the clusters
+```
+
+### Profiles and names
+
+The centroids are in z scores. The profile table gives the item means in the
+original 1 to 7 units, the cluster sizes, and who the person played with.
+
+```{r cluster-profiles}
+cluster_profile <- function(labels) {
+  train[bangs] %>%
+    mutate(cluster = labels) %>%
+    group_by(cluster) %>%
+    summarise(across(everything(), ~ round(mean(.x, na.rm = TRUE), 1)),
+              days = n(), .groups = "drop") %>%
+    as.data.frame()
+}
+
+cluster_profile(km_fits[[2]]$cluster)   # K = 2, for comparison
+cluster_profile(km$cluster)
+```
+
+The names are assigned by rule, so they stay attached to the right cluster
+even if the cluster numbers change:
+
+- the cluster with the highest relationships mean is the **connected play
+  day**;
+- of the other two, the one with lower autonomy is the **frustrating play
+  day**;
+- the last is the **smooth solo play day**.
+
+```{r cluster-names}
+prof <- cluster_profile(km$cluster)
+connected   <- prof$cluster[which.max(prof$gaming_relationships)]
+others      <- setdiff(prof$cluster, connected)
+frustrating <- others[which.min(prof$gaming_autonomy[match(others, prof$cluster)])]
+smooth      <- setdiff(others, c(frustrating))
+
+cluster_names <- character(k_final)
+cluster_names[connected]   <- "Connected play day"
+cluster_names[frustrating] <- "Frustrating play day"
+cluster_names[smooth]      <- "Smooth solo play day"
+
+type_levels <- c("Smooth solo play day", "Connected play day", "Frustrating play day")
+train$play_day_type <- factor(cluster_names[km$cluster], levels = type_levels)
+
+table(train$play_day_type)
+```
+
+```{r cluster-plot, fig.width = 9, fig.height = 3.2, fig.cap = "Cluster centroids on the six BANGS items (z scores, training days)."}
+as.data.frame(km$centers) %>%
+  mutate(cluster = paste0(cluster_names, " (n = ", km$size, ")")) %>%
+  pivot_longer(-cluster, names_to = "item", values_to = "z") %>%
+  mutate(item = sub("gaming_", "", item)) %>%
+  ggplot(aes(item, z, fill = item)) +
+  geom_col() + geom_hline(yintercept = 0) +
+  facet_wrap(~ cluster) + coord_flip() +
+  theme(legend.position = "none") +
+  labs(x = NULL, y = "Cluster mean (z score)")
+```
+
+Who people played with, and what they played, in each type (row
+percentages, training days):
+
+```{r cluster-context}
+round(100 * prop.table(table(train$play_day_type, train$play_context), 1))
+round(100 * prop.table(table(train$play_day_type, train$game_type), 1))
+```
+
+What the three types are:
+
+- **Smooth solo play day.** The person played the way they wanted and made
+  progress. There was little disappointment and almost no toxicity, but no
+  relationships were formed. Most of these days were solo, single-player
+  play.
+- **Connected play day.** The gaming went just as smoothly, and the person
+  also formed relationships with other players or characters. These days are
+  split between solo and friends play. The item asks about players *or
+  characters*, so a story game can count.
+- **Frustrating play day.** Autonomy and progress were lower, and wishing to
+  do something else, disappointment, and toxicity were higher. Team
+  competition and strangers-only play are more common than on the other
+  types of day.
+
+Compared with the proposal: the expected day with a "satisfying solo
+session" appears. The days with a "toxic competitive" or "low improvement"
+session appear together as one frustrating type, which leans toward
+competitive play but is not defined by it. Toxicity is only moderate even there (mean
+`r prof$gaming_toxic[frustrating]` on the 1 to 7 scale, below the midpoint).
+At K = 4 the two separate (Section 8), but the extra split is less stable
+and is not supported by the silhouette.
+
+### Life satisfaction across the types (training days)
+
+```{r target-by-cluster}
+train %>%
+  group_by(play_day_type) %>%
+  summarise(days = n(),
+            mean_life_sat = round(mean(life_satisfaction), 1),
+            sd_life_sat   = round(sd(life_satisfaction), 1),
+            pct_stress    = round(100 * mean(had_stress == "Yes", na.rm = TRUE), 1),
+            mean_sleep    = round(mean(sleep_quality, na.rm = TRUE), 2)) %>%
+  as.data.frame()
+```
+
+```{r target-by-cluster-plot, fig.height = 3.5, fig.cap = "Life satisfaction by type of play day (training days)."}
+ggplot(train, aes(play_day_type, life_satisfaction, fill = play_day_type)) +
+  geom_boxplot() +
+  theme(legend.position = "none") +
+  labs(x = NULL, y = "Life satisfaction today (0 to 100)")
+```
+
+The type of play day is clearly related to life satisfaction that day, even
+though no BANGS item asks about life. Frustrating play days are the lowest
+and connected play days the highest. The spread within each type is wide,
+and these are same-day associations. A bad day may make the gaming feel
+worse as much as the other way around.
+
+### Test days
+
+`kmeans()` has no `predict()` method. A test day joins the training centroid
+it is closest to, in the training-standardized units.
+
+```{r assign-test}
+nearest_centroid <- function(x, centers) {
+  x  <- as.matrix(x)
+  d2 <- sapply(seq_len(nrow(centers)), function(k)
+    rowSums((x - matrix(centers[k, ], nrow(x), ncol(x), byrow = TRUE))^2))
+  max.col(-d2, ties.method = "first")
+}
+
+test$play_day_type <- factor(cluster_names[nearest_centroid(test_bangs, km$centers)],
+                            levels = type_levels)
+
+# the rule gives the training days their own clusters back
+mean(nearest_centroid(train_bangs, km$centers) == km$cluster)
+
+round(rbind(train = prop.table(table(train$play_day_type)),
+            test  = prop.table(table(test$play_day_type))), 2)
+
+# days with no BANGS answers were filled with the training medians, so they
+# all get the play-day type nearest the median profile
+table(filled_day_type = c(
+  as.character(train$play_day_type[rowSums(is.na(train[bangs])) > 0]),
+  as.character(test$play_day_type[rowSums(is.na(test[bangs])) > 0])))
+```
+
+## 6b. Principal components: dimensions of a day's needs
+
+### The block
+
+```{r needs-recipe}
+rec_needs <- recipe(~ ., data = train[needs]) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  prep()
+
+train_needs <- bake(rec_needs, new_data = train)
+test_needs  <- bake(rec_needs, new_data = test)
+
+round(cor(train_needs), 2)
+```
+
+```{r pca}
+pca <- prcomp(train_needs, center = TRUE, scale. = TRUE)
+summary(pca)
+```
+
+### How many components?
+
+We use the three rules from the PCA lecture, parallel analysis (one of the
+criteria the handout lists), and theory:
+
+- **The scree plot.** Keep the components before the curve flattens.
+- **The eigenvalue rule.** A component's eigenvalue is its variance. Each
+  standardized item has a variance of 1, so a component with an eigenvalue
+  of 1 or more explains more than a single item does. The lecture uses 1 as
+  the cutoff and the walkthrough's code uses 0.75, so both are shown.
+- **Cumulative variance.** Keep enough components to explain 80% of the
+  variance.
+- **Parallel analysis.** Run PCA on 100 sets of random, uncorrelated data of
+  the same size (`r nrow(train_needs)` days by `r length(needs)` items).
+  Keep a component only if its eigenvalue beats the 95th percentile of the
+  random eigenvalues at the same position, so it holds more than chance
+  alone would give.
+- **Theory.** What the items were written to measure.
+
+```{r n-components}
+eig <- pca$sdev^2
+pve <- eig / sum(eig)
+
+# parallel analysis: eigenvalues of random data with the same rows and columns
+set.seed(559)
+random_eig <- replicate(100, prcomp(matrix(rnorm(nrow(train_needs) * length(needs)),
+                                           ncol = length(needs)), scale. = TRUE)$sdev^2)
+pa_cut <- apply(random_eig, 1, quantile, 0.95)
+
+n_comp_rules <- data.frame(PC = seq_along(eig), eigenvalue = round(eig, 2),
+                           pve = round(pve, 3), cumulative = round(cumsum(pve), 3),
+                           random_95 = round(pa_cut, 3))
+n_comp_rules
+
+# components each rule keeps (eigenvalues fall in order, so a count works)
+c(eigenvalue_1      = sum(eig >= 1),
+  eigenvalue_0.75   = sum(eig >= 0.75),
+  cumulative_80     = which(cumsum(pve) >= 0.80)[1],
+  parallel_analysis = sum(eig > pa_cut))
+```
+
+```{r scree-plot, fig.height = 3.2, fig.cap = "Scree plot: proportion of variance explained by each component of the six needs items (training days). The dashed line is the parallel-analysis cutoff on the same scale."}
+ggplot(n_comp_rules, aes(PC, pve)) +
+  geom_point() + geom_line() +
+  geom_line(aes(y = random_95 / length(needs)), linetype = "dashed") +
+  scale_x_continuous(breaks = seq_along(eig)) +
+  labs(y = "Proportion of variance explained")
+```
+
+**Choosing the number.** The rules disagree, which the lecture notes is
+normal:
+
+| Rule | Components kept |
+|---|---|
+| Scree plot | 1: the curve drops steeply from component 1 to 2 (`r round(100 * pve[1], 1)`% to `r round(100 * pve[2], 1)`%) and flattens after that |
+| Eigenvalue of 1 or more (lecture) | `r sum(eig >= 1)` |
+| Eigenvalue of 0.75 or more (walkthrough) | `r sum(eig >= 0.75)` (the second eigenvalue is `r round(eig[2], 2)`) |
+| 80% of the variance | `r which(cumsum(pve) >= 0.80)[1]` (two components explain `r round(100 * cumsum(pve)[2], 1)`%, three `r round(100 * cumsum(pve)[3], 1)`%) |
+| Parallel analysis | `r sum(eig > pa_cut)` (the second eigenvalue, `r round(eig[2], 2)`, is below the random cutoff of `r round(pa_cut[2], 2)`) |
+| Theory (self-determination theory) | 2: need satisfaction and need frustration |
+
+Parallel analysis and the eigenvalue rule at 1 agree here, and with this
+much data they are close to the same test, so they count as one piece of
+evidence rather than two. Parallel analysis replaces the fixed cutoff of 1
+with the eigenvalues of random data, which stray from 1 only by chance. With
+`r nrow(train_needs)` days and `r length(needs)` items they barely stray (the
+cutoff for the second component is `r round(pa_cut[2], 2)`). The two rules
+part ways only when the sample is small or the items are many.
+
+- **The case for one.** The first component alone explains
+  `r round(100 * pve[1])`% of the variance. It is a general "good day for my
+  needs" dimension, with every satisfaction item positive and every
+  frustration item negative.
+- **We keep two**, as theory and the walkthrough's cutoff say.
+  Self-determination theory treats satisfaction and frustration as separate
+  experiences, and the proposal predicted exactly these two dimensions. Two
+  components also carry more of the frustration items, which the first
+  component carries less well.
+- **Section 8 checks** one and three components (the 80% rule's choice)
+  against two on the training folds.
+
+```{r loadings}
+n_keep <- 2
+
+loadings <- pca$rotation[, 1:n_keep] %*% diag(pca$sdev[1:n_keep])
+colnames(loadings) <- paste0("PC", 1:n_keep)
+round(loadings, 2)
+```
+
+### Rotation and names
+
+The unrotated pair is one general component plus a contrast, which is hard to
+name. A varimax rotation turns the two axes within the same plane. The
+variance they explain together does not change.
+
+```{r rotate}
+rotation <- varimax(loadings)
+rotated  <- unclass(rotation$loadings)
+colnames(rotated) <- paste0("RC", 1:n_keep)
+
+# flip each component so its strongest items load positively
+flip <- sign(apply(rotated, 2, function(l) l[which.max(abs(l))]))
+rotated <- sweep(rotated, 2, flip, "*")
+
+# name each component by which kind of item it carries
+sat_items  <- grepl("_satisfied$", rownames(rotated))
+is_sat     <- colMeans(abs(rotated[sat_items, ])) > colMeans(abs(rotated[!sat_items, ]))
+comp_names <- unname(ifelse(is_sat, "need_satisfaction", "need_frustration"))
+stopifnot(!anyDuplicated(comp_names))
+colnames(rotated) <- comp_names
+
+round(rotated, 2)
+
+# variance explained by the two rotated components together
+round(sum(rotated^2) / length(needs), 3)
+```
+
+```{r loadings-plot, fig.width = 5.5, fig.height = 3.5, fig.cap = "Rotated loadings of the six needs items on the two components."}
+as.data.frame(rotated) %>%
+  mutate(item = factor(sub("needs_", "", rownames(rotated)),
+                       levels = rev(sub("needs_", "", rownames(rotated))))) %>%
+  pivot_longer(-item, names_to = "component", values_to = "loading") %>%
+  ggplot(aes(component, item, fill = loading)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", loading)), size = 3.5) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1, 1)) +
+  labs(x = NULL, y = NULL)
+```
+
+- **Need satisfaction.** The three satisfaction items (autonomy, competence,
+  relatedness) load highly. A high score is a day the person did what they
+  valued, did it well, and felt close to people.
+- **Need frustration.** The three frustration items load highly (after the
+  flip). A high score is a day the person felt forced, insecure, or
+  excluded. Competence frustration loads on both components.
+
+### Compared with the proposal
+
+The proposal expected two components, one for general satisfaction and one
+for general frustration, rather than one for each need. It read that result
+as days differing "more in how fulfilling or frustrating they are overall
+rather than in which specific need is met." Two numbers help check that
+reading: how strongly the satisfied and frustrated items go together, and
+what a third component would hold.
+
+```{r needs-vs-proposal}
+needs_cor <- cor(train_needs)
+sat <- grepl("_satisfied$", needs)
+
+# correlations between each satisfied item and each frustrated item
+round(range(needs_cor[sat, !sat]), 2)
+
+# three varimax-rotated components; the one that carries relatedness
+# frustration most, flipped so that item loads positively (Section 8 tests
+# whether a third component helps prediction)
+L3 <- unclass(varimax(pca$rotation[, 1:3] %*% diag(pca$sdev[1:3]))$loadings)
+rel_comp <- which.max(abs(L3["needs_relatedness_frustrated", ]))
+third <- L3[, rel_comp] * sign(L3["needs_relatedness_frustrated", rel_comp])
+round(third, 2)
+```
+
+- **What matches.** The two rotated components are need satisfaction and
+  need frustration, as predicted. Each item loads mainly on its own side, and
+  neither component belongs to a single need.
+- **Satisfaction and frustration go together.** The first unrotated
+  component alone explains `r round(100 * pve[1])`% of the variance, and
+  every satisfied item correlates between
+  `r round(min(needs_cor[sat, !sat]), 2)` and
+  `r round(max(needs_cor[sat, !sat]), 2)` with every frustrated item. A day
+  that meets a person's needs is usually also a day low in frustration. The
+  two rotated scores are uncorrelated only because varimax keeps the axes at
+  right angles. That is a property of the method, not a finding.
+- **One need partly stands apart: relatedness.** A third component, the one
+  the 80% rule would keep, is mostly relatedness: relatedness frustration
+  loads `r round(third[["needs_relatedness_frustrated"]], 2)` and relatedness
+  satisfaction `r round(third[["needs_relatedness_satisfied"]], 2)`. It is
+  small (eigenvalue `r round(eig[3], 2)`, `r round(100 * pve[3], 1)`% of the
+  variance), and Section 8 shows it adds nothing to predicting life
+  satisfaction. Autonomy and competence cannot be told apart: their
+  satisfaction items correlate
+  `r round(needs_cor["needs_autonomy_satisfied", "needs_competence_satisfied"], 2)`.
+- **Days and people.** The components are fit on days pooled across people,
+  so they mix differences between people with differences between one
+  person's days. A high need-satisfaction score marks a good day partly
+  because it marks a person whose days usually go well.
+
+The proposal's reading holds, with one qualification: the days differ mostly
+in how fulfilling they are overall, but relatedness carries a little variance
+of its own. These components are **dimensions** of a day. The **types** of
+days come from the clustering in Section 6a.
+
+### Scores for every day
+
+Test scores use the training weights, the training SDs, and the same rotation
+and flip.
+
+```{r scores}
+component_scores <- function(block) {
+  raw <- predict(pca, newdata = block)[, 1:n_keep, drop = FALSE]
+  standardized <- sweep(raw, 2, pca$sdev[1:n_keep], "/")
+  out <- sweep(standardized %*% rotation$rotmat, 2, flip, "*")
+  colnames(out) <- comp_names
+  out
+}
+
+train <- bind_cols(train, as.data.frame(component_scores(train_needs)))
+test  <- bind_cols(test,  as.data.frame(component_scores(test_needs)))
+
+round(rbind(train_mean = colMeans(train[comp_names]),
+            train_sd   = sapply(train[comp_names], sd),
+            test_mean  = colMeans(test[comp_names])), 2)
+
+# days with no needs answers were filled with the training medians, so they
+# all get the same two scores
+unique(round(as.data.frame(train)[rowSums(is.na(train[needs])) > 0, comp_names], 2))
+```
+
+### Components, clusters, and the target (training days)
+
+```{r comp-cluster}
+train %>%
+  group_by(play_day_type) %>%
+  summarise(days = n(), across(all_of(comp_names), ~ round(mean(.x), 2))) %>%
+  as.data.frame()
+
+round(cor(train[c(comp_names, "life_satisfaction")]), 2)
+```
+
+Need satisfaction is strongly related to life satisfaction on the same day.
+That is expected, and Section 7 discusses what it means for the model. Need
+frustration is related more weakly, and in the opposite direction. The
+play-day types line up with the components: frustrating play days are
+lower on need satisfaction and higher on need frustration. The two blocks
+describe overlapping but different parts of the day.
+
+# 7. Feature Sets and Leakage
+
+## Feature sets A and B
+
+Both sets share every predictor that is not in the needs block, including the
+six BANGS items:
+
+- **Set A** adds the six needs items.
+- **Set B** replaces the six needs items with their two component scores and
+  adds the play-day type (the cluster) as a factor, as the handout defines
+  set B.
+
+The clustering block is a chosen set of predictors (the BANGS items), not the
+PCA block, as the handout allows. So the BANGS items stay in both sets, and
+the A versus B comparison asks two things. Do two scores carry what the six
+needs items carry? Does the play-day type add anything to the items it was
+built from?
+
+```{r feature-sets}
+shared <- c(bangs, day_preds, person_preds)
+set_A  <- c(shared, needs)
+set_B  <- c(shared, comp_names, "play_day_type")
+
+c(A = length(set_A), B = length(set_B))
+setdiff(set_A, set_B)
+setdiff(set_B, set_A)
+
+train_A <- train[c("life_satisfaction", set_A)]
+train_B <- train[c("life_satisfaction", set_B)]
+test_A  <- test[c("life_satisfaction", set_A)]
+test_B  <- test[c("life_satisfaction", set_B)]
+```
+
+## Data leakage we considered
+
+- **The target in another form.** Affective valence (r =
+  `r round(cor(raw$affective_valence, raw$life_satisfaction, use = "complete.obs"), 2)`
+  with life satisfaction) was removed.
+  - The needs items are kept, as the proposal planned. They ask about the
+    day's experiences (doing what one values, feeling close to people), not
+    about satisfaction with life. But they are answered in the same sitting,
+    and need satisfaction correlates
+    `r round(cor(train$need_satisfaction, train$life_satisfaction), 2)` with
+    the target. Much of the model's accuracy will come from them, and that
+    accuracy describes what goes together on a day. It does not show that
+    needs cause life satisfaction.
+  - No block contains the target, so no cluster or component is built from
+    it.
+- **Lags.** Every daily predictor is from the same day, so there is no lag
+  that could reach forward into the next day.
+- **Repeated measures.** The split and the folds hold out whole people
+  (Section 5).
+- **Preprocessing.** Imputation, dummy coding, and scaling are in recipes,
+  re-learned inside each fold. The recoding in Section 3 learns nothing from
+  the data.
+- **Unsupervised structure.** The clusters and components were fit on the
+  training days only, and the test days were scored from that fit.
+  - One smaller issue remains inside cross-validation. The cluster
+    centroids, the component weights, and the medians that fill the blocks
+    were learned from all training days, so in each fold the held-out days
+    helped shape them.
+  - The structure never uses the target, and six items fit on about 8,700
+    days barely move when a tenth of them are held out. So the effect on the
+    cross-validated comparison should be negligible.
+  - The test set is untouched by this.
+- **Information from the future.** The intake survey must come before the
+  diary days it describes:
+
+```{r intake-timing}
+intake_time <- as.POSIXct(train$intake_date, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+gap_days    <- as.numeric(difftime(train$date, intake_time, units = "days"))
+summary(gap_days)
+c(diary_days_before_intake = sum(gap_days < 0, na.rm = TRUE))
+```
+
+# 8. Supervised Models
+
+## Recipes
+
+```{r recipes}
+# regularized regression: dummy columns and standardized predictors
+recipe_linear <- function(dat) {
+  recipe(life_satisfaction ~ ., data = dat) %>%
+    step_impute_median(age, education) %>%
+    step_impute_knn(all_predictors(), neighbors = 5) %>%
+    step_dummy(all_nominal_predictors()) %>%
+    step_zv(all_predictors()) %>%
+    step_normalize(all_numeric_predictors())
+}
+
+# trees: the same imputation, factors kept whole, no scaling
+recipe_tree <- function(dat) {
+  recipe(life_satisfaction ~ ., data = dat) %>%
+    step_impute_median(age, education) %>%
+    step_impute_knn(all_predictors(), neighbors = 5) %>%
+    step_zv(all_predictors())
+}
+
+rec <- list(linear_A = recipe_linear(train_A), linear_B = recipe_linear(train_B),
+            tree_A   = recipe_tree(train_A),   tree_B   = recipe_tree(train_B))
+
+# prep once to check the recipes and count the columns each model sees
+baked <- lapply(rec, function(r) bake(prep(r), new_data = NULL))
+sapply(baked, function(b) c(columns = ncol(b) - 1, missing_left = sum(is.na(b))))
+```
+
+- **Imputation.** Age and education get the training median, because they
+  are constant within a person. Everything else is imputed with five nearest
+  neighbors, never using the target.
+- **The ordered stressor factor** becomes polynomial contrasts for the
+  elastic net. The trees split it only between neighboring levels.
+- **The trees** do not need dummy columns or scaling.
+
+## Models and tuning grids
+
+The handout requires a null model, a regularized regression with `glmnet`,
+and a tree ensemble. As in the course walkthrough, we fit the null model,
+the elastic net, and the random forest, on both feature sets, with the same
+`r n_folds` grouped folds and the same seeds.
+The folds are fit in parallel, so the random parts of each fit are fixed by
+the seeds list in `trainControl()` (Section 5), which is drawn from
+`set.seed(559)`.
+
+**Reproducibility.** We checked this by refitting. The null model, both
+elastic nets, both random forests, and every check in this section
+reproduce exactly.
+
+| Model | `method` | Tuning grid |
+|---|---|---|
+| Null (training mean) | `"null"` | none; it uses no predictors, so it is fit once |
+| Elastic net | `"glmnet"` | `alpha` 0, 0.25, 0.5, 0.75, 1 (0 is ridge, 1 is the lasso) × 60 `lambda` values, log-spaced from 10^-4 × to 10 × the smallest lambda that zeroes every coefficient |
+| Random forest | `"ranger"` | `mtry` 2, √p, p/3, p/2, p (rounded, p = predictor count of that set) × `min.node.size` 5, 20, 50, 100, 200; `splitrule = "variance"`; 500 trees; impurity importance; `respect.unordered.factors = "order"`, so an unordered factor's levels are sorted by their mean life satisfaction before each split (ranger's default would split them in their stored order). The first run used `mtry` up to p/2 and `min.node.size` 5, 20, 50. The best values were at the top edge (node size 50 for both sets, `mtry` p/2 for set B), so p, 100, and 200 were added |
+
+A helper reports whether each best tuning value is inside its grid or at an
+edge. A best value at an edge would mean the grid should be widened.
+
+```{r edge-helper}
+edge_check <- function(fit) {
+  sapply(names(fit$bestTune), function(v) {
+    vals <- sort(unique(fit$results[[v]]))
+    b    <- fit$bestTune[[v]]
+    if (length(vals) == 1) "fixed"
+    else if (b == min(vals)) "lowest value tried"
+    else if (b == max(vals)) "highest value tried"
+    else "interior"
+  })
+}
+
+# fit a model, or read the saved fit. set.seed(559) stays right before each
+# train() call, as in the walkthrough; the seeds in `ctrl` are what fix the
+# parallel fits
+fit_dir <- out_path("model_fits")
+dir.create(fit_dir, showWarnings = FALSE)
+
+# The recipe's column selectors keep a link to the R session they were made
+# in, so a saved fit can carry a copy of every object in the session (over
+# 100 MB a file). Pointing them at the global environment before saving keeps
+# each file small. Nothing after the fit uses that link: the cross-validated
+# results and the predictions are unchanged.
+drop_session <- function(x) {
+  if (rlang::is_quosure(x)) return(rlang::quo_set_env(x, globalenv()))
+  if (is.list(x) && !is.data.frame(x)) {
+    a <- attributes(x)
+    x <- lapply(x, drop_session)
+    attributes(x) <- a
+  }
+  x
+}
+
+fit_or_load <- function(name, expr) {
+  file <- file.path(fit_dir, paste0(name, ".rds"))
+  if (!refit_models && file.exists(file)) return(readRDS(file))
+  fit <- expr                       # evaluated here, so the fit runs only when needed
+  fit$recipe$steps <- lapply(fit$recipe$steps, drop_session)
+  saveRDS(fit, file)
+  fit
+}
+
+# fit the folds in parallel: caret sends each fold to its own R worker. The
+# seeds in `ctrl` (drawn from set.seed(559)) fix the random parts of each
+# fit whatever the number of cores. Two cores
+# are left free for the rest of the computer.
+n_workers <- max(1, min(n_folds, parallel::detectCores() - 2))
+cl <- makePSOCKcluster(n_workers)
+registerDoParallel(cl)
+```
+
+## Null model
+
+```{r fit-null}
+fit_null <- fit_or_load("null", {
+  set.seed(559)
+  train(rec$linear_A, data = train_A, method = "null", trControl = ctrl)
+})
+getTrainPerf(fit_null)
+```
+
+## Elastic net
+
+```{r fit-glmnet}
+lambda_grid <- function(b) {
+  x <- as.matrix(b[names(b) != "life_satisfaction"])
+  lambda_max <- max(glmnet(x, b$life_satisfaction, alpha = 1)$lambda)
+  10^seq(log10(lambda_max) - 4, log10(lambda_max) + 1, length.out = 60)
+}
+
+fit_glmnet_A <- fit_or_load("glmnet_A", {
+  set.seed(559)
+  train(rec$linear_A, data = train_A, method = "glmnet", trControl = ctrl,
+        tuneGrid = expand.grid(alpha = seq(0, 1, 0.25),
+                               lambda = lambda_grid(baked$linear_A)))
+})
+fit_glmnet_B <- fit_or_load("glmnet_B", {
+  set.seed(559)
+  train(rec$linear_B, data = train_B, method = "glmnet", trControl = ctrl,
+        tuneGrid = expand.grid(alpha = seq(0, 1, 0.25),
+                               lambda = lambda_grid(baked$linear_B)))
+})
+
+rbind(A = cbind(fit_glmnet_A$bestTune, t(edge_check(fit_glmnet_A))),
+      B = cbind(fit_glmnet_B$bestTune, t(edge_check(fit_glmnet_B))))
+```
+
+```{r glmnet-plot, fig.height = 3.5, fig.cap = "Elastic net: cross-validated RMSE across lambda, one line per alpha (feature set A)."}
+ggplot(fit_glmnet_A) + scale_x_log10()
+```
+
+## Random forest
+
+```{r fit-rf}
+# widened after the first run (see the table above): p added to mtry, and
+# 100 and 200 added to min.node.size
+rf_grid <- function(p) {
+  expand.grid(mtry = sort(unique(pmax(2, round(c(2, sqrt(p), p / 3, p / 2, p))))),
+              splitrule = "variance",
+              min.node.size = c(5, 20, 50, 100, 200))
+}
+p_A <- ncol(baked$tree_A) - 1
+p_B <- ncol(baked$tree_B) - 1
+
+fit_rf_A <- fit_or_load("rf_A", {
+  set.seed(559)
+  train(rec$tree_A, data = train_A, method = "ranger", trControl = ctrl,
+        tuneGrid = rf_grid(p_A), num.trees = 500, importance = "impurity",
+        respect.unordered.factors = "order",
+        num.threads = 1)   # one thread per fold; the folds already run in parallel
+})
+fit_rf_B <- fit_or_load("rf_B", {
+  set.seed(559)
+  train(rec$tree_B, data = train_B, method = "ranger", trControl = ctrl,
+        tuneGrid = rf_grid(p_B), num.trees = 500, importance = "impurity",
+        respect.unordered.factors = "order",
+        num.threads = 1)
+})
+
+rbind(A = cbind(fit_rf_A$bestTune, t(edge_check(fit_rf_A))),
+      B = cbind(fit_rf_B$bestTune, t(edge_check(fit_rf_B))))
+```
+
+```{r rf-plot, fig.height = 3.5, fig.cap = "Random forest: cross-validated RMSE across mtry and minimum node size (feature set A)."}
+ggplot(fit_rf_A)
+```
+
+**Edges.** The edge labels in the tables above show whether each best tuning
+value was inside its grid. Both elastic nets' best `alpha` and `lambda` are
+inside the grid.
+
+```{r rf-edge}
+# set A's forest at its best mtry, across node sizes (used below)
+rf_A_nodes <- filter(fit_rf_A$results, mtry == fit_rf_A$bestTune$mtry)
+```
+
+**The random forest.** Its grid was widened after the first run's best
+values landed on the top edge (see the grid table).
+
+- Set B's best values are inside the wider grid: `mtry` =
+  `r fit_rf_B$bestTune$mtry` with node size
+  `r fit_rf_B$bestTune$min.node.size`.
+- Set A's best node size is now `r fit_rf_A$bestTune$min.node.size`, the
+  bottom of the grid and ranger's default for regression (with `mtry` =
+  `r fit_rf_A$bestTune$mtry`).
+- At that `mtry`, the RMSE barely changes from node size 5 to 50
+  (`r paste(round(range(rf_A_nodes$RMSE[rf_A_nodes$min.node.size <= 50]), 3), collapse = " to ")`).
+  Set A's best forest is
+  `r round(min(fit_rf_A$results$RMSE) - min(fit_glmnet_B$results$RMSE), 2)`
+  RMSE behind the best elastic net, so smaller nodes would not change the
+  ranking.
+
+## The cross-validated comparison
+
+Every model used the same folds, so `resamples()` lines them up fold by fold.
+
+```{r resamples}
+fits <- list(null = fit_null,
+             glmnet_A = fit_glmnet_A, glmnet_B = fit_glmnet_B,
+             rf_A = fit_rf_A, rf_B = fit_rf_B)
+
+model_label <- c(null = "Null", glmnet = "Elastic net", rf = "Random forest")
+
+results_cv <- resamples(fits)
+summary(results_cv)$statistics$RMSE |> round(3)
+```
+
+The table the report needs: one row per model and feature set, with the
+mean over the folds and the fold-to-fold spread (SD) of each metric.
+
+```{r cv-table}
+# per-fold values of one metric, one column per model
+fold_values <- function(metric) {
+  v <- results_cv$values[, grep(paste0("~", metric, "$"), names(results_cv$values))]
+  names(v) <- sub(paste0("~", metric), "", names(v))
+  v
+}
+
+rmse_folds <- fold_values("RMSE")
+r2_folds   <- fold_values("Rsquared")
+mae_folds  <- fold_values("MAE")
+
+cv_table <- data.frame(
+  model       = unname(model_label[sub("_.*", "", names(rmse_folds))]),
+  feature_set = ifelse(names(rmse_folds) == "null", "none", sub(".*_", "", names(rmse_folds))),
+  RMSE        = colMeans(rmse_folds),
+  RMSE_SD     = apply(rmse_folds, 2, sd),
+  Rsquared    = colMeans(r2_folds),      # NA for the null model: its predictions do not vary
+  Rsquared_SD = apply(r2_folds, 2, sd),
+  MAE         = colMeans(mae_folds),
+  MAE_SD      = apply(mae_folds, 2, sd),
+  row.names   = NULL) %>%
+  arrange(RMSE)
+
+cv_table %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+```{r cv-dotplot, fig.height = 3.5, fig.cap = "Cross-validated RMSE by model, with 95% confidence intervals across folds."}
+dotplot(results_cv, metric = "RMSE")
+```
+
+```{r cv-plot, fig.height = 3.5, fig.cap = "Cross-validated RMSE per fold, by model and feature set. Each line is one fold."}
+# one row per fold and model, for the plot and the saved results
+cv_long <- data.frame(fold = results_cv$values$Resample, rmse_folds, check.names = FALSE) %>%
+  pivot_longer(-fold, names_to = "key", values_to = "RMSE") %>%
+  mutate(model       = unname(model_label[sub("_.*", "", key)]),
+         feature_set = ifelse(key == "null", "none", sub(".*_", "", key)))
+
+cv_long %>%
+  filter(key != "null") %>%
+  ggplot(aes(feature_set, RMSE, group = fold)) +
+  geom_line(alpha = 0.5) + geom_point() +
+  facet_wrap(~ model) +
+  labs(x = "Feature set", y = "Fold RMSE")
+```
+
+### Did the unsupervised features help? Set A versus set B, fold by fold
+
+The same folds scored both feature sets, so the fair comparison is within
+each fold. For each model, the difference is set A's fold RMSE minus set B's
+on the same fold, as in the course walkthrough:
+
+- **A positive difference means set B did better** (lower RMSE) on that
+  fold.
+- The difference counts as **larger than the fold-to-fold variability** if
+  its mean is more than two standard errors from zero. The standard error is
+  the SD of the `r n_folds` fold differences divided by the square root of
+  `r n_folds`.
+
+```{r a-vs-b}
+# each fit's fold RMSEs, in fold order
+fold_rmse <- function(fit) fit$resample[order(fit$resample$Resample), "RMSE"]
+
+# A minus B on each fold
+ab <- data.frame(
+  fold   = sort(fit_glmnet_A$resample$Resample),
+  glmnet = fold_rmse(fit_glmnet_A) - fold_rmse(fit_glmnet_B),
+  rf     = fold_rmse(fit_rf_A)     - fold_rmse(fit_rf_B))
+
+ab %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+# mean difference (A minus B), its spread across folds, and the 2 SE rule
+diffs  <- ab[-1]
+a_vs_b <- data.frame(
+  model          = unname(model_label[names(diffs)]),
+  RMSE_A         = sapply(names(diffs), function(m) mean(fold_rmse(fits[[paste0(m, "_A")]]))),
+  RMSE_B         = sapply(names(diffs), function(m) mean(fold_rmse(fits[[paste0(m, "_B")]]))),
+  A_minus_B      = colMeans(diffs),
+  sd_diff        = apply(diffs, 2, sd),
+  two_SE         = 2 * apply(diffs, 2, sd) / sqrt(nrow(diffs)),
+  folds_B_better = colSums(diffs > 0),
+  row.names      = NULL)
+a_vs_b$beyond_noise <- abs(a_vs_b$A_minus_B) > a_vs_b$two_SE
+
+a_vs_b %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+### Checking the cluster and component choices
+
+The number of clusters and the number of components were chosen in Section 6
+from the elbow, the silhouette, and the eigenvalue rules. This section checks
+those choices against the alternatives: K = 2 and K = 4 clusters, and one or
+three components. Everything here uses the training days and the same
+`r n_folds` folds. The test set is not touched.
+
+Each check refits the final model type, the elastic net on set B, with one
+piece of set B swapped and everything else held fixed.
+
+```{r check-setup}
+# set B with one piece swapped; NULL leaves that piece out
+set_B_variant <- function(types = train$play_day_type,
+                          needs_block = train[comp_names]) {
+  d <- train[c("life_satisfaction", shared)]
+  if (!is.null(needs_block)) d <- bind_cols(d, needs_block)
+  if (!is.null(types)) d$play_day_type <- types
+  d
+}
+
+# the same recipe, grid, folds, and seed as fit_glmnet_B
+fit_glmnet_check <- function(name, d) {
+  fit_or_load(name, {
+    r <- recipe_linear(d)
+    b <- bake(prep(r), new_data = NULL)
+    set.seed(559)
+    train(r, data = d, method = "glmnet", trControl = ctrl,
+          tuneGrid = expand.grid(alpha = seq(0, 1, 0.25),
+                                 lambda = lambda_grid(b)))
+  })
+}
+
+# fold-by-fold comparison with the chosen version, read like A minus B:
+# chosen minus variant on each fold, so positive = the variant did better
+check_table <- function(fit_list, chosen) {
+  ref <- fold_rmse(fit_list[[chosen]])
+  do.call(rbind, lapply(names(fit_list), function(n) {
+    r <- fold_rmse(fit_list[[n]])
+    d <- ref - r
+    data.frame(variant = n, RMSE = mean(r),
+               Rsquared = mean(fit_list[[n]]$resample$Rsquared),
+               chosen_minus_variant = mean(d),
+               two_SE = 2 * sd(d) / sqrt(length(d)),
+               folds_variant_better = sum(d > 0))
+  })) %>%
+    mutate(across(where(is.numeric), ~ round(.x, 3)))
+}
+```
+
+#### Clusters: K = 2, 3, and 4
+
+The K = 2 and K = 4 types are named by rules, like the K = 3 types:
+
+- **K = 2.** The cluster with higher autonomy is the **good play day**, and
+  the other is the **bad play day**.
+- **K = 4.**
+  - The highest relationships mean is the **connected play day**.
+  - Of the rest, the lowest autonomy is the **stalled play day**.
+  - Of the remaining two, the higher toxicity is the **toxic social play
+    day**.
+  - The last is the **smooth solo play day**.
+
+```{r check-k-profiles}
+name_k2 <- function(prof) {
+  ifelse(prof$gaming_autonomy == max(prof$gaming_autonomy),
+         "Good play day", "Bad play day")
+}
+name_k4 <- function(prof) {
+  connected <- which.max(prof$gaming_relationships)
+  rest      <- setdiff(seq_len(nrow(prof)), connected)
+  stalled   <- rest[which.min(prof$gaming_autonomy[rest])]
+  rest      <- setdiff(rest, stalled)
+  toxic     <- rest[which.max(prof$gaming_toxic[rest])]
+  nm <- character(nrow(prof))
+  nm[c(connected, stalled, toxic, setdiff(rest, toxic))] <-
+    c("Connected play day", "Stalled play day", "Toxic social play day",
+      "Smooth solo play day")
+  nm
+}
+
+k_labels <- list(`2` = name_k2(cluster_profile(km_fits[[2]]$cluster)),
+                 `3` = cluster_names,
+                 `4` = name_k4(cluster_profile(km_fits[[4]]$cluster)))
+k_type <- function(k) k_labels[[as.character(k)]][km_fits[[k]]$cluster]
+
+k_profiles <- bind_rows(lapply(2:4, function(k) {
+  cl <- km_fits[[k]]$cluster
+  cluster_profile(cl) %>%
+    mutate(K = k, type = k_labels[[as.character(k)]][cluster],
+           pct_days = round(100 * days / sum(days)),
+           mean_life_sat = round(as.numeric(tapply(train$life_satisfaction, cl, mean)), 1)) %>%
+    select(K, type, days, pct_days, mean_life_sat, all_of(bangs))
+}))
+k_profiles
+
+# how each solution splits the one before it (training days)
+table(K2 = k_type(2), K3 = k_type(3))
+table(K3 = k_type(3), K4 = k_type(4))
+```
+
+```{r check-k-plot, fig.width = 10, fig.height = 6.5, fig.cap = "Cluster centroids on the six BANGS items for K = 2, 3, and 4 (z scores, training days)."}
+bind_rows(lapply(2:4, function(k) {
+  as.data.frame(km_fits[[k]]$centers) %>%
+    mutate(K = paste("K =", k),
+           type = paste0(k_labels[[as.character(k)]], "\n(", km_fits[[k]]$size, " days)"))
+})) %>%
+  pivot_longer(all_of(bangs), names_to = "item", values_to = "z") %>%
+  mutate(item = factor(sub("gaming_", "", item),
+                       levels = rev(sub("gaming_", "", bangs)))) %>%
+  ggplot(aes(z, item, fill = z > 0)) +
+  geom_col() + geom_vline(xintercept = 0) +
+  facet_wrap(~ K + type, ncol = 4, labeller = label_wrap_gen(multi_line = FALSE)) +
+  scale_fill_manual(values = c("#b2182b", "#2166ac"), guide = "none") +
+  labs(x = "Cluster mean (z score)", y = NULL)
+```
+
+**Stability.** A real type should come back when the data change a little.
+K-means is refit on 20 random samples of 80% of the training people. All
+training days are then assigned to the nearest centroid of that fit and
+compared with the full solution by the adjusted Rand index (1 = the same
+partition, 0 = chance agreement).
+
+```{r check-k-stability}
+adjusted_rand <- function(a, b) {
+  tab <- table(a, b)
+  n   <- sum(tab)
+  s   <- sum(choose(tab, 2))
+  sa  <- sum(choose(rowSums(tab), 2))
+  sb  <- sum(choose(colSums(tab), 2))
+  expected <- sa * sb / choose(n, 2)
+  (s - expected) / ((sa + sb) / 2 - expected)
+}
+
+train_people <- unique(train$id)
+set.seed(559)
+k_stability <- sapply(2:4, function(k) {
+  replicate(20, {
+    keep <- train$id %in% sample(train_people, round(0.8 * length(train_people)))
+    sub_fit <- kmeans(train_bangs[keep, ], centers = k, nstart = 25, iter.max = 50)
+    adjusted_rand(nearest_centroid(train_bangs, sub_fit$centers), km_fits[[k]]$cluster)
+  })
+})
+colnames(k_stability) <- paste0("K", 2:4)
+
+k_stability_table <- data.frame(
+  K = 2:4,
+  silhouette = round(k_choice$silhouette[2:4], 3),
+  wss_share_of_k1 = round(k_choice$wss[2:4] / k_choice$wss[1], 3),
+  stability_mean = round(colMeans(k_stability), 3),
+  stability_min  = round(apply(k_stability, 2, min), 3),
+  life_sat_r2 = round(sapply(2:4, function(k)
+    summary(lm(train$life_satisfaction ~ factor(km_fits[[k]]$cluster)))$r.squared), 3))
+k_stability_table
+```
+
+**Prediction.** The elastic net on set B with the play-day type from each K,
+and without it:
+
+```{r check-k-fits}
+check_k_fits <- list(
+  no_play_day_type = fit_glmnet_check("check_no_type", set_B_variant(types = NULL)),
+  K2              = fit_glmnet_check("check_K2", set_B_variant(types = factor(k_type(2)))),
+  K3_chosen       = fit_glmnet_B,
+  K4              = fit_glmnet_check("check_K4", set_B_variant(types = factor(k_type(4)))))
+
+check_k_table <- check_table(check_k_fits, "K3_chosen")
+check_k_table
+
+# the play-day-type coefficients the elastic net kept (standardized dummies)
+type_coefs <- lapply(check_k_fits[-1], function(f) {
+  cf <- as.matrix(coef(f$finalModel, f$bestTune$lambda))
+  round(cf[grep("^play_day_type", rownames(cf)), 1], 2)
+})
+type_coefs
+```
+
+**What the check shows.**
+
+- **K = 2** separates good play days from bad ones. It has the highest
+  silhouette (`r k_stability_table$silhouette[1]`), but it hides the
+  difference between connected and solo play. K = 3 recovers that
+  difference, and the two good types differ in life satisfaction.
+- **K = 4** is a finer cut. It splits the frustrating play days into a
+  **toxic social** type and a **stalled** type. These are the days with the
+  "toxic competitive" and "low improvement" sessions the proposal expected.
+  It also moves some connected play days into the toxic social type. The criteria do
+  not support the extra split:
+  - the silhouette is no better (`r k_stability_table$silhouette[3]` against
+    `r k_stability_table$silhouette[2]` at K = 3);
+  - the solution is less stable (mean adjusted Rand
+    `r k_stability_table$stability_mean[3]` against
+    `r k_stability_table$stability_mean[2]`);
+  - it explains little more of life satisfaction (R² =
+    `r k_stability_table$life_sat_r2[3]` against
+    `r k_stability_table$life_sat_r2[2]`).
+- **K = 3 is kept.** It is as stable as K = 2 (mean adjusted Rand
+  `r sprintf("%.3f", k_stability_table$stability_mean[2])` against
+  `r sprintf("%.3f", k_stability_table$stability_mean[1])`), it sits at the elbow, and its
+  types are distinct enough to name.
+- **The number of clusters does not change prediction.** Every version is
+  within `r max(abs(check_k_table$chosen_minus_variant))` RMSE of the chosen one,
+  and the largest two-SE band is `r max(check_k_table$two_SE)`. Dropping the
+  play-day type entirely changes nothing either. The clusters are built from
+  the six BANGS items, and set B already contains those items. So the
+  play-day type describes the days but gives the model nothing new.
+
+#### Components: one, two, or three
+
+```{r check-pc-solutions}
+# scores for m components, built the same way as the chosen two:
+# standardized, varimax-rotated when m > 1, and flipped so the strongest
+# loading is positive
+pca_alternative <- function(m) {
+  L <- pca$rotation[, 1:m, drop = FALSE] %*% diag(pca$sdev[1:m], m)
+  rotmat <- diag(m)
+  if (m > 1) {
+    v <- varimax(L)
+    L <- unclass(v$loadings)
+    rotmat <- v$rotmat
+  }
+  fl <- sign(apply(L, 2, function(l) l[which.max(abs(l))]))
+  L  <- sweep(L, 2, fl, "*")
+  colnames(L) <- paste0("C", 1:m)
+  sc <- sweep(predict(pca, newdata = train_needs)[, 1:m, drop = FALSE],
+              2, pca$sdev[1:m], "/")
+  sc <- sweep(sc %*% rotmat, 2, fl, "*")
+  colnames(sc) <- colnames(L)
+  list(loadings = L, scores = as.data.frame(sc), communality = rowSums(L^2))
+}
+
+pc_alt <- lapply(1:3, pca_alternative)
+
+# loadings of the one- and three-component solutions
+round(pc_alt[[1]]$loadings, 2)
+round(pc_alt[[3]]$loadings, 2)
+
+# share of each item's variance the retained components carry
+pc_communality <- round(sapply(pc_alt, `[[`, "communality"), 2)
+colnames(pc_communality) <- paste(1:3, "comp.")
+pc_communality
+```
+
+```{r check-pc-fits}
+check_pc_fits <- list(
+  one_component          = fit_glmnet_check("check_PC1", set_B_variant(needs_block = pc_alt[[1]]$scores)),
+  two_components_chosen  = fit_glmnet_B,
+  three_components       = fit_glmnet_check("check_PC3", set_B_variant(needs_block = pc_alt[[3]]$scores)),
+  six_needs_items        = fit_glmnet_check("check_raw_needs", set_B_variant(needs_block = train[needs])),
+  no_needs_items         = fit_glmnet_check("check_no_needs", set_B_variant(needs_block = NULL)))
+
+check_pc_table <- check_table(check_pc_fits, "two_components_chosen")
+check_pc_table
+```
+
+**What the check shows.**
+
+- **One component loses information about frustration.** It carries only
+  `r round(100 * pc_communality["needs_autonomy_frustrated", 1])`% of the
+  variance in autonomy frustration, against
+  `r round(100 * pc_communality["needs_autonomy_frustrated", 2])`% with two.
+- **Two components predict better than one.** The one-component model's
+  RMSE is `r -check_pc_table$chosen_minus_variant[1]` higher, with a two-SE band
+  of `r check_pc_table$two_SE[1]`. Two components did better in
+  `r n_folds - check_pc_table$folds_variant_better[1]` of the `r n_folds` folds. The gain
+  is small, but it is consistent and larger than the fold-to-fold noise.
+- **Three components and the six raw items add nothing.** Both are within
+  noise of the two components. Two scores carry what the six items carry.
+- **The needs block matters.** Without it, the cross-validated R² falls from
+  `r check_pc_table$Rsquared[2]` to `r check_pc_table$Rsquared[5]`.
+- **Two components are kept.** The scree plot, the eigenvalue rule at 1,
+  and parallel analysis favor one, and the 80% rule favors three. The walkthrough's eigenvalue
+  cutoff, self-determination theory's split of satisfaction from
+  frustration, and this check all favor two.
+
+### Choosing the final model
+
+The rule:
+
+1. Take the model with the lowest mean cross-validated RMSE.
+2. If a simpler model is within two standard errors of it, fold by fold, take
+   the simpler model instead. The elastic net is simpler than the random
+   forest, and set B (fewer columns) is simpler than set A.
+
+The rule was set before the test set was opened.
+
+```{r choose-final}
+complexity <- c(glmnet_B = 1, glmnet_A = 2, rf_B = 3, rf_A = 4)
+cand <- names(complexity)
+
+mean_rmse <- sapply(cand, function(k) mean(fold_rmse(fits[[k]])))
+best <- names(which.min(mean_rmse))
+
+# how far each model's RMSE is above the best one's, fold by fold
+# (zero for the best model itself), and the 2 SE of those differences
+above_best <- sapply(cand, function(k) {
+  d <- fold_rmse(fits[[k]]) - fold_rmse(fits[[best]])
+  c(diff = mean(d), two_SE = 2 * sd(d) / sqrt(length(d)))
+})
+within_noise <- cand[above_best["diff", ] <= above_best["two_SE", ]]
+final_key <- within_noise[which.min(complexity[within_noise])]
+
+data.frame(model = cand, mean_RMSE = round(mean_rmse, 3),
+           RMSE_above_best = round(above_best["diff", ], 3),
+           two_SE = round(above_best["two_SE", ], 3),
+           within_noise = cand %in% within_noise, row.names = NULL)
+
+c(lowest_RMSE = best, final_model = final_key)
+final_fit <- fits[[final_key]]
+```
+
+The final model is the
+**`r model_label[[sub("_.*", "", final_key)]]` on feature set
+`r sub(".*_", "", final_key)`**.
+
+### The final model's coefficients (training fit)
+
+The recipe standardizes every column, including the dummy columns. So each
+coefficient is the change in life satisfaction (0 to 100) for one standard
+deviation of that column, with every other predictor held fixed. A
+coefficient of zero means the penalty dropped that column (its lasso part,
+since `alpha` = `r final_fit$bestTune$alpha`).
+
+```{r final-coefs, eval = grepl("^glmnet", final_key)}
+cf <- as.matrix(coef(final_fit$finalModel, final_fit$bestTune$lambda))[, 1]
+final_coefs <- data.frame(predictor = names(cf), coef = unname(cf)) %>%
+  filter(predictor != "(Intercept)")
+
+c(intercept = round(unname(cf["(Intercept)"]), 2),
+  nonzero = sum(final_coefs$coef != 0), columns = nrow(final_coefs))
+
+final_coefs %>%
+  filter(coef != 0) %>%
+  arrange(desc(abs(coef))) %>%
+  mutate(coef = round(coef, 2))
+
+# columns the penalty set to zero
+final_coefs$predictor[final_coefs$coef == 0]
+```
+
+**The worst-stressor columns.** `stress_worst` is an ordered factor, so
+`step_dummy()` codes it with polynomial contrasts:
+
+- `stress_worst_1` is a linear trend across None < Not very < Somewhat <
+  Very;
+- `stress_worst_2` is a quadratic bend;
+- `stress_worst_3` is a cubic wiggle.
+
+These three coefficients do not line up with the levels, so the table below
+translates them. It predicts one training day four times, changing only the
+worst stressor. The model is linear, so the differences are the same for any
+day.
+
+```{r stress-levels, eval = grepl("^glmnet", final_key)}
+final_train <- if (grepl("_A$", final_key)) train_A else train_B
+
+# a day with no missing values, so the imputation step changes nothing
+one_day <- final_train[complete.cases(final_train), ][rep(1, nlevels(train$stress_worst)), ]
+one_day$stress_worst <- factor(levels(train$stress_worst),
+                               levels = levels(train$stress_worst), ordered = TRUE)
+level_pred <- predict(final_fit, newdata = one_day)
+
+stress_level_effects <- train %>%
+  filter(!is.na(stress_worst)) %>%
+  group_by(stress_worst) %>%
+  summarise(days = n(), mean_life_sat = round(mean(life_satisfaction), 1),
+            .groups = "drop") %>%
+  mutate(raw_gap_vs_none   = round(mean_life_sat - mean_life_sat[1], 1),
+         model_gap_vs_none = round(level_pred - level_pred[1], 1)) %>%
+  as.data.frame()
+stress_level_effects
+```
+
+- **The raw gap** is the difference in mean life satisfaction from days with
+  no stressful event.
+- **The model gap** is the same difference with every other predictor held
+  fixed.
+- **The model gap is much smaller.** A day with a very stressful event is
+  `r abs(stress_level_effects$raw_gap_vs_none[4])` points lower on average,
+  but only `r abs(stress_level_effects$model_gap_vs_none[4])` points lower
+  once needs, sleep, and the rest are held fixed. Stressful days also have
+  worse needs and sleep, and those predictors take their share.
+- **The decline is curved.** A mild stressor barely changes the prediction,
+  and the drop grows at "Somewhat" and "Very."
+
+# 9. The Test Set
+
+This section runs once, after the final model was chosen above.
+
+```{r test-eval, eval = run_test_set}
+test_final <- if (grepl("_A$", final_key)) test_A else test_B
+
+test_pred <- data.frame(observed  = test_final$life_satisfaction,
+                        predicted = predict(final_fit, newdata = test_final))
+
+test_perf <- postResample(test_pred$predicted, test_pred$observed)
+null_test <- postResample(rep(mean(train$life_satisfaction), nrow(test_pred)),
+                          test_pred$observed)
+
+round(rbind(final_model_test = test_perf,
+            final_model_cv   = unlist(getTrainPerf(final_fit)[1:3]),
+            null_test        = null_test), 3)
+
+# for scale, as in the walkthrough: the SD of life satisfaction in the test days
+round(sd(test_pred$observed), 3)
+```
+
+```{r test-plot, eval = run_test_set, fig.height = 4, fig.cap = "Observed against predicted life satisfaction, test days."}
+ggplot(test_pred, aes(predicted, observed)) +
+  geom_point(alpha = 0.15) +
+  geom_abline(linetype = "dashed") +
+  coord_equal(xlim = c(0, 100), ylim = c(0, 100)) +
+  labs(x = "Predicted life satisfaction", y = "Observed life satisfaction")
+```
+
+```{r test-folds, eval = run_test_set}
+# the final model's cross-validated metrics across the folds, for comparison
+final_folds <- final_fit$resample
+round(sapply(final_folds[c("RMSE", "Rsquared", "MAE")], range), 3)
+```
+
+**The test result.** The final model was run once on the
+`r if (run_test_set) format(nrow(test_pred), big.mark = ",")` test days,
+from people it never saw in training.
+
+- **RMSE** `r if (run_test_set) round(test_perf[["RMSE"]], 2)` on the test
+  days, against `r round(getTrainPerf(final_fit)$TrainRMSE, 2)` in
+  cross-validation. **R²**
+  `r if (run_test_set) round(test_perf[["Rsquared"]], 3)` against
+  `r round(getTrainPerf(final_fit)$TrainRsquared, 3)`, and **MAE**
+  `r if (run_test_set) round(test_perf[["MAE"]], 2)` against
+  `r round(getTrainPerf(final_fit)$TrainMAE, 2)`.
+- All three are inside the range of the `r n_folds` folds (RMSE
+  `r paste(round(range(final_fit$resample$RMSE), 2), collapse = " to ")`,
+  R² `r paste(round(range(final_fit$resample$Rsquared), 3), collapse = " to ")`).
+  The cross-validated estimate held up on new people.
+- Predicting the training mean for every test day gives an RMSE of
+  `r if (run_test_set) round(null_test[["RMSE"]], 2)` (the SD of life
+  satisfaction in the test days is
+  `r if (run_test_set) round(sd(test_pred$observed), 2)`). The final model's
+  typical error is
+  `r if (run_test_set) round(100 * (1 - test_perf[["RMSE"]] / null_test[["RMSE"]]))`%
+  smaller.
+- A typical error of about
+  `r if (run_test_set) round(test_perf[["MAE"]])` points on the 0 to 100
+  scale is enough to flag days that are likely to be low. It is too coarse to
+  rank two days that are close.
+
+## Variable importance
+
+```{r varimp, eval = run_test_set, fig.height = 5, fig.cap = "Variable importance of the final model (top 20)."}
+vi <- varImp(final_fit)
+vi_table <- vi$importance %>%
+  tibble::rownames_to_column("predictor") %>%
+  rename(importance = Overall) %>%
+  arrange(desc(importance))
+head(vi_table, 20) %>% mutate(importance = round(importance, 1))
+
+plot(vi, top = 20)
+```
+
+For `glmnet`, `varImp()` is the absolute value of each coefficient, scaled so
+the largest is 100. The recipe standardized every numeric predictor, so the
+coefficients are comparable.
+
+- The two need components come first:
+  `r if (run_test_set) vi_table$predictor[1]` (100) and
+  `r if (run_test_set) vi_table$predictor[2]` (`r if (run_test_set) round(vi_table$importance[2])`).
+- Next are
+  `r if (run_test_set) vi_table$predictor[3]` (`r if (run_test_set) round(vi_table$importance[3])`)
+  and the linear trend of the day's worst stressor,
+  `r if (run_test_set) vi_table$predictor[4]` (`r if (run_test_set) round(vi_table$importance[4])`).
+- Everything else, including every BANGS item and the person
+  characteristics, scores below
+  `r if (run_test_set) ceiling(vi_table$importance[5])`.
+
+# 10. Compare and Interpret
+
+**Did the unsupervised features help?** Look at the A versus B table in
+Section 8:
+
+- For every model, compare `A_minus_B` with `two_SE` (a positive
+  `A_minus_B` means set B had the lower RMSE). Set B
+  `r if (all(!a_vs_b$beyond_noise)) "was within fold-to-fold noise of set A for every model" else paste0("differed from set A beyond noise for ", paste(a_vs_b$model[a_vs_b$beyond_noise], collapse = ", "))`.
+- Set B swaps six needs items for two scores and adds a three-level
+  play-day type. Set B matches set A, so the two components carry what the six items
+  carry, in a third of the columns.
+- The play-day type adds nothing on top of the BANGS items it was built from,
+  because both sets keep those items. The check in Section 8 shows the
+  elastic net does as well without it, at any K.
+
+**Do the clusters and components mean something for the research question?**
+
+- Need satisfaction is the strongest single correlate of life satisfaction
+  in the training days (r =
+  `r round(cor(train$need_satisfaction, train$life_satisfaction), 2)`).
+- Frustrating play days have the lowest mean life satisfaction.
+- The final model leans on the components. Its two largest coefficients
+  (Section 8) are need satisfaction
+  (`r round(final_coefs$coef[final_coefs$predictor == "need_satisfaction"], 1)`
+  points per SD) and need frustration
+  (`r round(final_coefs$coef[final_coefs$predictor == "need_frustration"], 1)`).
+  The penalty set both play-day-type columns to zero. The variable importance
+  in Section 9 shows the same ranking.
+
+**What a model of days can tell the users, and what it cannot.**
+
+- *What it can tell them.* A well-being check-in could combine a few
+  in-game questions with a short needs check. It would flag days that are
+  likely to be low in life satisfaction for that player. A frustrating
+  play day is one marker.
+- *What it cannot tell them.* About `r round(100 * icc)`% of the variation
+  in life satisfaction is between people. A model of days cannot say which
+  players are generally less satisfied with their lives, or why. That
+  question needs a model of people, with person-level averages and traits
+  as the unit.
+- *Same-day caveat.* Because every predictor is from the same day, the model
+  describes what goes together. It does not forecast tomorrow.
+
+**Which model to hand over, and what is lost.**
+
+- The final model is the `r model_label[[sub("_.*", "", final_key)]]` on set
+  `r sub(".*_", "", final_key)`. It also had the lowest cross-validated RMSE,
+  so no accuracy was given up for readability.
+- It can be shared as a list of coefficients, with the direction and size of
+  every effect. Nothing is lost in interpretability.
+- The random forest did slightly worse (best cross-validated RMSE
+  `r round(min(cv_table$RMSE[cv_table$model == "Random forest"]), 2)`,
+  against `r round(min(cv_table$RMSE), 2)`), and it would give users only
+  importance rankings.
+
+# 11. Save the Results
+
+```{r save}
+results <- list(
+  counts = counts, solo_rule = solo_rule, split_sizes = split_sizes, icc = icc, n_folds = n_folds,
+  miss_table = miss_table, intake_missing = intake_missing, var_table = var_table,
+  k_choice = k_choice, k_final = k_final, cluster_names = cluster_names,
+  cluster_profile = cluster_profile(km$cluster), km = km,
+  n_comp_rules = n_comp_rules, n_keep = n_keep, loadings = loadings,
+  rotated = rotated, comp_names = comp_names,
+  k_profiles = k_profiles, k_stability_table = k_stability_table,
+  check_k_table = check_k_table, type_coefs = type_coefs,
+  pc_communality = pc_communality, check_pc_table = check_pc_table,
+  set_A = set_A, set_B = set_B,
+  cv_table = cv_table, cv_long = cv_long, ab = ab, a_vs_b = a_vs_b,
+  best_tune = lapply(fits, `[[`, "bestTune"),
+  edges = lapply(fits[-1], edge_check),
+  final_key = final_key)
+
+if (exists("final_coefs")) {
+  results$final_coefs <- final_coefs
+  results$stress_level_effects <- stress_level_effects
+}
+
+if (run_test_set) {
+  results$test_perf <- test_perf
+  results$null_test <- null_test
+  results$test_pred <- test_pred
+  results$vi_table  <- vi_table
+}
+
+saveRDS(results, out_path("final_results.rds"))
+
+# all models are fit; shut down the parallel workers
+stopCluster(cl)
+registerDoSEQ()
+```
+
+# 12. Software
+
+The package versions this file ran with, for the References section and for
+reproducing the results.
+
+```{r session-info}
+sessionInfo()
+```
